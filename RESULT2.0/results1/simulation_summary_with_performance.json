@@ -1,0 +1,42 @@
+{
+  "simulation_parameters": {
+    "num_nodes": 100,
+    "field_size": "100x100m",
+    "max_rounds": 1000,
+    "transmission_range": 20,
+    "initial_energy_range": "2.0-5.0J",
+    "packet_size": 12000,
+    "sleep_scheduling_enabled": true,
+    "duty_cycle": 0.3,
+    "adaptive_duty_cycle": true,
+    "coordinator_duty_cycle": 0.8
+  },
+  "results": {
+    "network_lifetime": 1000,
+    "first_node_death_round": 504,
+    "final_alive_nodes": 96,
+    "final_energy_percentage": 45.9606552832954,
+    "total_packets_transmitted": 27907,
+    "final_awake_percentage": 20.833333333333336,
+    "final_sleep_efficiency": 79.16666666666666,
+    "final_avg_duty_cycle": 0.35253616670375093,
+    "total_wake_up_events": 0,
+    "avg_coverage_redundancy": 5.447916666666667
+  },
+  "performance_metrics": {
+    "average_round_time_seconds": 0.8391059823036194,
+    "peak_memory_mb": 727.91015625,
+    "cache_statistics": {},
+    "optimization_features": [
+      "batch_processing",
+      "memory_management",
+      "vectorized_computations",
+      "pre_computed_embeddings",
+      "lru_caching"
+    ],
+    "first_node_death_time_seconds": 525.248708486557,
+    "total_simulation_time_seconds": 1064.9752974510193,
+    "average_throughput_bps": 371420.787421039,
+    "total_bits_transmitted": 334836000
+  }
+}
