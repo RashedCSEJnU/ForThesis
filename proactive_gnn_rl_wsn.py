@@ -472,8 +472,8 @@ E_AMP = 100e-12       # Energy for transmitter amplifier (J/bit/m², as in thesi
 E_DA = 5e-9           # Energy for data aggregation (J/bit)
 PACKET_SIZE = 4000    # Size of data packet (bits, as in thesis)
 CONTROL_PACKET_SIZE = 500  # Size of control packets (bits)
-E_SLEEP = 0.0001      # Much lower sleep energy per round
-E_LISTEN = 0.0005     # Lower listen energy per round
+E_SLEEP = 0.001       # Energy consumption during sleep mode (J/round, fixed small value)
+E_LISTEN = 50e-9      # Energy for listening/idle mode (J/bit)
 DEAD_NODE_THRESHOLD = 0.0  # Node is dead only when energy is zero
 
 # Simulation parameters - Optimized
@@ -485,11 +485,11 @@ DUTY_CYCLE = 0.3                # Percentage of time a node is active (30%)
 SLEEP_ROUND_DURATION = 1        # Duration of each sleep/wake cycle in rounds
 WAKE_ROUND_DURATION = 2         # Duration of wake period in rounds
 MIN_ACTIVE_NEIGHBORS = 2        # Minimum active neighbors required for coverage
-E_SLEEP = 0.001               # Energy consumption during sleep mode (J/round, fixed small value)
-E_LISTEN = 50e-9               # Energy for listening/idle mode (J/bit)
 COORDINATOR_DUTY_CYCLE = 0.8    # Cluster heads have higher duty cycle
 ADAPTIVE_DUTY_CYCLE = True      # Enable adaptive duty cycling based on traffic
 SLEEP_COORDINATION_ENERGY = 10e-9  # Energy for sleep coordination messages
+PER_ROUND_VISUALIZATION = False # Toggle for per-round visualization
+EXPORT_METRICS_CSV = True       # Toggle for exporting per-round metrics to CSV
 
 # Duty cycle limits for adaptive scheduling
 MIN_DUTY_CYCLE = 0.05
@@ -1216,33 +1216,31 @@ def adaptive_duty_cycle_adjustment(node, traffic_level, energy_ratio):
     duty = base + 0.2 * traffic_level - 0.2 * (1 - energy_ratio)
     return np.clip(duty, MIN_DUTY_CYCLE, MAX_DUTY_CYCLE)
 
-def predict_future_energies(gnn_model, network):
-    """Placeholder: Predict future energies using GNN model (returns current energies)"""
-    # In a real implementation, use the GNN to predict future energy for each node
-    return {node['id']: node['E'] for node in network}
-
 def train_gnn_model(gnn_model, gnn_optimizer, network_history):
-    """Placeholder: Train the GNN model on network history (returns dummy loss)"""
-    # In a real implementation, perform a training step and return the loss
-    return 0.0
+    """Train the GNN model on network history (returns dummy loss or raises error if not implemented)"""
+    # Placeholder implementation: raise error to ensure user is aware
+    raise NotImplementedError("train_gnn_model is a placeholder. Please implement GNN training logic.")
 
-def update_energy_after_transmission(network, path, energy_consumed):
-    """Update energy for nodes along a path after transmission"""
-    for node in path:
-        node['E'] -= energy_consumed / len(path)
-        node['E'] = max(0, node['E'])
+def predict_future_energies(gnn_model, network):
+    """Predict future energies using GNN model (returns current energies or raises error if not implemented)"""
+    # Placeholder implementation: raise error to ensure user is aware
+    raise NotImplementedError("predict_future_energies is a placeholder. Please implement GNN-based energy prediction.")
 
 def find_optimal_path_drl(source_node, sink_pos, network=None, *args, **kwargs):
-    """Placeholder: Find optimal path using DRL (returns direct path and estimated energy)"""
-    # In a real implementation, use DRL agent to select the best path
-    if network is not None:
-        # Find the node closest to the sink
-        sink_node = min(network, key=lambda n: np.sqrt((n['x']-sink_pos[0])**2 + (n['y']-sink_pos[1])**2))
-        path = [source_node, sink_node]
-    else:
-        path = [source_node]
-    energy_consumed = 0.01 * len(path)  # Dummy value
-    return path, energy_consumed
+    """Find optimal path using DRL (returns direct path and estimated energy or raises error if not implemented)"""
+    # Placeholder implementation: raise error to ensure user is aware
+    raise NotImplementedError("find_optimal_path_drl is a placeholder. Please implement DRL-based path finding.")
+
+############################## Energy Update Function ##############################
+
+def update_energy_after_transmission(network, path, energy_consumed):
+    """Update energy for nodes along a path after transmission (vectorized for performance)"""
+    if not path or energy_consumed <= 0:
+        return
+    per_node_energy = energy_consumed / len(path)
+    for node in path:
+        node['E'] -= per_node_energy
+        node['E'] = max(0, node['E'])
 
 ############################## Main Simulation ##############################
 
@@ -1616,6 +1614,7 @@ def run_proactive_gnn_wsn_simulation():
            
             plt.xlabel('Training Iteration')
             plt.ylabel('DRL Loss')
+
             plt.title('DRL Training Loss Over Iterations')
             plt.grid(True, alpha=0.3)
             plt.legend()
