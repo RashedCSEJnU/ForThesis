@@ -1,0 +1,16 @@
+{
+  "round": 1000,
+  "alive_nodes": 99,
+  "alive_percentage": 99.0,
+  "total_energy": 266.5759800988496,
+  "avg_energy": 2.6926866676651473,
+  "min_energy": 0.495065241805669,
+  "max_energy": 4.825911080598665,
+  "energy_variance": 1.0900037098128312,
+  "total_traffic": 336912,
+  "avg_traffic": 3369.12,
+  "num_cluster_heads": 9,
+  "drl_epsilon": null,
+  "connectivity": true,
+  "sink_connectivity": 100.0
+}

@@ -22,6 +22,8 @@ import psutil
 from functools import lru_cache
 import gc
 import warnings
+from datetime import datetime
+import os
 warnings.filterwarnings('ignore')
 
 # Create directory for saving results
@@ -38,6 +40,9 @@ if torch.cuda.is_available():
 # Check for CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+# Adding debug statements to trace execution
+print("Debug: Device initialized")
 
 ############################## WSN Parameters ##############################
 
@@ -576,10 +581,12 @@ def graph_to_pyg_data(G, network):
 
 def initialize_network(num_nodes, field_x, field_y, sink_x, sink_y, range_c):
     """Initialize WSN with randomly placed nodes"""
+    print("Debug: Entered initialize_network")
     network = []
-    
+
     # Create sensor nodes
     for i in range(num_nodes):
+        print(f"Debug: Initializing node {i}")
         node = {}
         node['id'] = i
         node['x'] = random.uniform(0, field_x)
@@ -610,7 +617,9 @@ def initialize_network(num_nodes, field_x, field_y, sink_x, sink_y, range_c):
         node['neighbors_in_range'] = 0 # For adaptive duty cycle
 
         network.append(node)
-    
+        print(f"Debug: Node {i} initialized")
+
+    print("Debug: All nodes initialized")
     return network
 
 def select_cluster_heads(network, ch_percentage, energy_predictions=None):
@@ -1149,96 +1158,335 @@ def calculate_network_metrics(network, round_num, agent_epsilon=None):
     
     return metrics
 
-def visualize_network(network, round_num, sink_pos, save_plot=True):
-    """Visualize the current network state"""
-    plt.figure(figsize=(12, 10))
+def visualize_network(network, round_num, sink_pos, save_plot=True, recent_paths=None):
+    """Enhanced visualization of the current network state with improved aesthetics and information"""
+    # Create larger figure with subplots for multiple views
+    fig = plt.figure(figsize=(20, 12))
     
-    # Plot alive nodes
+    # Main network topology plot
+    ax1 = plt.subplot(2, 3, (1, 4))  # Large main plot
+    
+    # Separate nodes by status and role
     alive_nodes = [node for node in network if node['cond'] == 1]
     dead_nodes = [node for node in network if node['cond'] == 0]
+    ch_nodes = [node for node in alive_nodes if node['role'] == 1]
+    regular_nodes = [node for node in alive_nodes if node['role'] == 0]
     
-    # Color nodes based on energy level
-    if alive_nodes:
-        alive_x = [node['x'] for node in alive_nodes]
-        alive_y = [node['y'] for node in alive_nodes]
-        alive_energies = [node['E'] / node['Eo'] for node in alive_nodes]
+    # Plot transmission range circles for cluster heads (optional)
+    for ch in ch_nodes:
+        circle = plt.Circle((ch['x'], ch['y']), TRANSMISSION_RANGE, 
+                          fill=False, color='lightblue', alpha=0.3, linestyle='--')
+        ax1.add_patch(circle)
+    
+    # Plot connectivity lines between nodes and their cluster heads
+    for node in regular_nodes:
+        if node.get('cluster'):
+            ch = next((ch for ch in ch_nodes if ch['id'] == node['cluster']), None)
+            if ch:
+                distance = np.sqrt((node['x'] - ch['x'])**2 + (node['y'] - ch['y'])**2)
+                if distance <= TRANSMISSION_RANGE:
+                    ax1.plot([node['x'], ch['x']], [node['y'], ch['y']], 
+                           'gray', alpha=0.3, linewidth=0.5)
+    
+    # Plot recent transmission paths if available
+    if recent_paths:
+        for i, path in enumerate(recent_paths[-5:]):  # Show last 5 paths
+            if path and len(path) > 1:
+                path_x = [node['x'] for node in path]
+                path_y = [node['y'] for node in path]
+                alpha = 0.8 - (i * 0.15)  # Fade older paths
+                ax1.plot(path_x, path_y, color='orange', alpha=alpha, 
+                        linewidth=2, marker='o', markersize=3)
+    
+    # Plot regular alive nodes with energy-based coloring
+    if regular_nodes:
+        regular_x = [node['x'] for node in regular_nodes]
+        regular_y = [node['y'] for node in regular_nodes]
+        regular_energies = [node['E'] / node['Eo'] for node in regular_nodes]
         
-        scatter = plt.scatter(alive_x, alive_y, c=alive_energies, 
-                            cmap='RdYlGn', s=60, alpha=0.7, vmin=0, vmax=1)
-        plt.colorbar(scatter, label='Energy Ratio')
+        scatter1 = ax1.scatter(regular_x, regular_y, c=regular_energies, 
+                             cmap='RdYlGn', s=80, alpha=0.8, vmin=0, vmax=1,
+                             edgecolors='black', linewidth=0.5)
+    
+    # Plot cluster heads with distinct styling
+    if ch_nodes:
+        ch_x = [node['x'] for node in ch_nodes]
+        ch_y = [node['y'] for node in ch_nodes]
+        ch_energies = [node['E'] / node['Eo'] for node in ch_nodes]
         
-        # Mark cluster heads
-        ch_nodes = [node for node in alive_nodes if node['role'] == 1]
-        if ch_nodes:
-            ch_x = [node['x'] for node in ch_nodes]
-            ch_y = [node['y'] for node in ch_nodes]
-            plt.scatter(ch_x, ch_y, c='blue', marker='s', s=100, 
-                       alpha=0.8, label='Cluster Heads')
+        ax1.scatter(ch_x, ch_y, c=ch_energies, cmap='RdYlGn', 
+                   marker='s', s=150, alpha=0.9, vmin=0, vmax=1,
+                   edgecolors='blue', linewidth=2, label='Cluster Heads')
+        
+        # Add CH ID labels
+        for ch in ch_nodes:
+            ax1.annotate(f'CH{ch["id"]}', (ch['x'], ch['y']), 
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=8, fontweight='bold')
     
     # Plot dead nodes
     if dead_nodes:
         dead_x = [node['x'] for node in dead_nodes]
         dead_y = [node['y'] for node in dead_nodes]
-        plt.scatter(dead_x, dead_y, c='black', marker='x', s=60, 
-                   alpha=0.8, label='Dead Nodes')
+        ax1.scatter(dead_x, dead_y, c='black', marker='x', s=100, 
+                   alpha=0.7, label='Dead Nodes', linewidth=2)
     
-    # Plot sink
-    plt.scatter(sink_pos[0], sink_pos[1], c='red', marker='*', s=200, 
-               label='Sink', edgecolors='black', linewidth=2)
+    # Plot sink with enhanced styling
+    ax1.scatter(sink_pos[0], sink_pos[1], c='red', marker='*', s=400, 
+               label='Sink', edgecolors='darkred', linewidth=3, zorder=10)
+    ax1.annotate('SINK', sink_pos, xytext=(10, 10), textcoords='offset points',
+                fontsize=12, fontweight='bold', color='red')
     
-    # Add network statistics as text
+    # Add colorbar for energy levels
+    if alive_nodes:
+        cbar = plt.colorbar(scatter1, ax=ax1, shrink=0.8)
+        cbar.set_label('Energy Ratio', fontsize=12)
+    
+    # Enhanced network statistics
     alive_count = len(alive_nodes)
     total_energy = sum(node['E'] for node in alive_nodes)
     avg_energy = total_energy / alive_count if alive_count > 0 else 0
+    min_energy = min(node['E'] for node in alive_nodes) if alive_nodes else 0
+    max_energy = max(node['E'] for node in alive_nodes) if alive_nodes else 0
     
     stats_text = f'Round: {round_num}\n'
-    stats_text += f'Alive Nodes: {alive_count}/{NUM_NODES}\n'
+    stats_text += f'Alive Nodes: {alive_count}/{NUM_NODES} ({alive_count/NUM_NODES*100:.1f}%)\n'
+    stats_text += f'Cluster Heads: {len(ch_nodes)}\n'
     stats_text += f'Avg Energy: {avg_energy:.3f}J\n'
+    stats_text += f'Min Energy: {min_energy:.3f}J\n'
+    stats_text += f'Max Energy: {max_energy:.3f}J\n'
     stats_text += f'Total Energy: {total_energy:.3f}J'
     
-    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-             verticalalignment='top', fontsize=10)
+    ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.9),
+             verticalalignment='top', fontsize=11, fontweight='bold')
     
-    plt.xlabel('X Position (m)')
-    plt.ylabel('Y Position (m)')
-    plt.title(f'WSN Topology - Round {round_num}')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xlim(0, FIELD_X)
-    plt.ylim(0, FIELD_Y)
+    ax1.set_xlabel('X Position (m)', fontsize=12)
+    ax1.set_ylabel('Y Position (m)', fontsize=12)
+    ax1.set_title(f'WSN Topology - Round {round_num}', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(-5, FIELD_X + 5)
+    ax1.set_ylim(-5, FIELD_Y + 5)
+    
+    # Energy distribution histogram
+    ax2 = plt.subplot(2, 3, 2)
+    if alive_nodes:
+        energies = [node['E'] for node in alive_nodes]
+        ax2.hist(energies, bins=15, alpha=0.7, color='green', edgecolor='black')
+        ax2.axvline(avg_energy, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_energy:.2f}J')
+        ax2.set_xlabel('Energy (J)')
+        ax2.set_ylabel('Number of Nodes')
+        ax2.set_title('Energy Distribution')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+    # Node status pie chart
+    ax3 = plt.subplot(2, 3, 3)
+    labels = ['Alive Regular', 'Cluster Heads', 'Dead']
+    sizes = [len(regular_nodes), len(ch_nodes), len(dead_nodes)]
+    colors = ['lightgreen', 'blue', 'red']
+    ax3.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    ax3.set_title('Node Status Distribution')
+    
+    # Traffic load visualization
+    ax4 = plt.subplot(2, 3, 5)
+    if alive_nodes:
+        traffic_loads = [node.get('traffic', 0) for node in alive_nodes]
+        node_ids = [node['id'] for node in alive_nodes]
+        bars = ax4.bar(range(len(alive_nodes)), traffic_loads, 
+                      color=['red' if node['role'] == 1 else 'blue' for node in alive_nodes])
+        ax4.set_xlabel('Node Index')
+        ax4.set_ylabel('Traffic Load')
+        ax4.set_title('Traffic Distribution Among Nodes')
+        ax4.grid(True, alpha=0.3)
+    
+    # Energy over time trend (if we have historical data)
+    ax5 = plt.subplot(2, 3, 6)
+    # This would need historical data - for now show current energy levels by node ID
+    if alive_nodes:
+        sorted_nodes = sorted(alive_nodes, key=lambda x: x['id'])
+        node_ids = [node['id'] for node in sorted_nodes]
+        energies = [node['E'] for node in sorted_nodes]
+        colors = ['red' if node['role'] == 1 else 'green' for node in sorted_nodes]
+        ax5.scatter(node_ids, energies, c=colors, alpha=0.7)
+        ax5.set_xlabel('Node ID')
+        ax5.set_ylabel('Current Energy (J)')
+        ax5.set_title('Energy by Node ID')
+        ax5.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     
     if save_plot:
-        plt.savefig(f'results/network_round_{round_num:04d}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'results/network_round_{round_num:04d}.png', dpi=200, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
 
+############################## Helper Functions ##############################
+
+def find_optimal_path_drl(source_node, sink_pos, network, agent, gnn_model, network_graph=None):
+    """Find optimal path using DRL agent with GNN embeddings"""
+    try:
+        if source_node['cond'] == 0:  # Dead node
+            return None, float('inf')
+        
+        path = [source_node]
+        current_node = source_node
+        visited = {source_node['id']}
+        total_energy_consumed = 0
+        max_hops = min(20, NUM_NODES)  # Prevent infinite loops
+        
+        # Create initial network graph if not provided
+        if network_graph is None:
+            network_graph = create_network_graph(network, sink_pos, TRANSMISSION_RANGE)
+        
+        for hop in range(max_hops):
+            # Check if we can reach sink directly
+            sink_distance = np.sqrt((current_node['x'] - sink_pos[0])**2 + 
+                                  (current_node['y'] - sink_pos[1])**2)
+            
+            if sink_distance <= TRANSMISSION_RANGE:
+                # Calculate energy for final transmission to sink
+                final_energy = calculate_transmission_energy(sink_distance, PACKET_SIZE)
+                total_energy_consumed += final_energy
+                
+                # Update current node energy
+                current_node['E'] = max(0, current_node['E'] - final_energy)
+                return path, total_energy_consumed
+            
+            # Find available next hop nodes
+            available_nodes = []
+            for node in network:
+                if (node['cond'] == 1 and 
+                    node['id'] not in visited and 
+                    node['id'] != current_node['id']):
+                    
+                    distance = np.sqrt((current_node['x'] - node['x'])**2 + 
+                                     (current_node['y'] - node['y'])**2)
+                    if distance <= TRANSMISSION_RANGE and can_node_transmit(node):
+                        available_nodes.append(node)
+            
+            if not available_nodes:
+                break  # No available neighbors
+            
+            # Get current network state as graph for GNN
+            G = create_network_graph(network, sink_pos, TRANSMISSION_RANGE)
+            pyg_data, node_map = graph_to_pyg_data(G, network)
+            
+            # Get GNN embeddings
+            with torch.no_grad():
+                gnn_model.eval()
+                node_embeddings, _ = gnn_model(pyg_data.x.to(device), 
+                                             pyg_data.edge_index.to(device),
+                                             pyg_data.edge_attr.to(device))
+            
+            # Get current state and GNN embedding
+            current_state = agent.get_state(current_node, network, sink_pos)
+            current_node_mapped_id = node_map.get(current_node['id'], 0)
+            if current_node_mapped_id < node_embeddings.size(0):
+                current_gnn_embedding = node_embeddings[current_node_mapped_id].unsqueeze(0)
+            else:
+                current_gnn_embedding = torch.zeros(1, node_embeddings.size(1)).to(device)
+            
+            # Use DRL agent to select next hop
+            next_node = agent.get_action(current_state, current_gnn_embedding, 
+                                       available_nodes, network_graph, current_node)
+            
+            if next_node is None:
+                break
+            
+            # Calculate energy consumption for this hop
+            etx, erx = calculate_energy_consumption(current_node, next_node, PACKET_SIZE)
+            hop_energy = etx + erx
+            total_energy_consumed += hop_energy
+            
+            # Update energies
+            current_node['E'] = max(0, current_node['E'] - etx)
+            next_node['E'] = max(0, next_node['E'] - erx)
+            
+            # Update traffic counters
+            current_node['traffic'] = current_node.get('traffic', 0) + 1
+            next_node['traffic'] = next_node.get('traffic', 0) + 1
+            
+            path.append(next_node)
+            visited.add(next_node['id'])
+            current_node = next_node
+        
+        # Check if we got close enough to sink for final transmission
+        final_distance = np.sqrt((current_node['x'] - sink_pos[0])**2 + 
+                               (current_node['y'] - sink_pos[1])**2)
+        
+        if final_distance <= TRANSMISSION_RANGE * 1.5:  # Allow some tolerance
+            final_energy = calculate_transmission_energy(final_distance, PACKET_SIZE)
+            total_energy_consumed += final_energy
+            current_node['E'] = max(0, current_node['E'] - final_energy)
+            return path, total_energy_consumed
+        
+        return None, float('inf')  # Failed to reach sink
+        
+    except Exception as e:
+        print(f"Error in find_optimal_path_drl: {e}")
+        return None, float('inf')
+
+def update_energy_after_transmission(network, path, energy_consumed):
+    """Update node energies after packet transmission"""
+    if not path or len(path) < 2:
+        return
+    
+    # Energy has already been updated in find_optimal_path_drl
+    # This function can be used for additional energy bookkeeping if needed
+    
+    # Update energy statistics for path nodes
+    for node in path:
+        if node['id'] in [n['id'] for n in network]:
+            # Find the actual network node and update its energy
+            network_node = next((n for n in network if n['id'] == node['id']), None)
+            if network_node:
+                network_node['E'] = node['E']  # Sync energies
+                
+                # Mark node as dead if energy is below threshold
+                if network_node['E'] <= DEAD_NODE_THRESHOLD:
+                    network_node['cond'] = 0
+
 ############################## Main Simulation ##############################
 
 def run_proactive_gnn_wsn_simulation():
-    """Run the main WSN simulation with proactive GNN-DRL routing"""
-    print("="*70)
-    print("PROACTIVE GNN-DRL WSN ROUTING SIMULATION")
-    print("="*70)
-    
-    # Initialize network
+    print("Debug: Entered run_proactive_gnn_wsn_simulation")
     print("Initializing WSN...")
-    network = initialize_network(NUM_NODES, FIELD_X, FIELD_Y, SINK_X, SINK_Y, TRANSMISSION_RANGE)
-    sink_pos = (SINK_X, SINK_Y)
-    
-    # Initialize GNN model
+    try:
+        network = initialize_network(NUM_NODES, FIELD_X, FIELD_Y, SINK_X, SINK_Y, TRANSMISSION_RANGE)
+        print("Debug: WSN initialized with nodes:", len(network))
+    except Exception as e:
+        print(f"Error during WSN initialization: {e}")
+
+    sink_pos = (SINK_X, SINK_Y)  # Define sink position
+    print("Debug: Sink position set to:", sink_pos)
+
     print("Initializing GNN model...")
-    gnn_model = WSN_GNN(NODE_FEATURE_SIZE, EDGE_FEATURE_SIZE, 
-                       GNN_HIDDEN_CHANNELS, GNN_OUTPUT_SIZE).to(device)
-    gnn_optimizer = optim.Adam(gnn_model.parameters(), lr=LEARNING_RATE)
-    
-    # Initialize DRL agent with correct embedding size
+    try:
+        gnn_model = WSN_GNN(NODE_FEATURE_SIZE, EDGE_FEATURE_SIZE, 
+                           GNN_HIDDEN_CHANNELS, GNN_OUTPUT_SIZE).to(device)
+        print("Debug: GNN model initialized")
+    except Exception as e:
+        print(f"Error during GNN model initialization: {e}")
+
+    try:
+        gnn_optimizer = optim.Adam(gnn_model.parameters(), lr=LEARNING_RATE)  # Initialize optimizer
+        print("Debug: GNN optimizer initialized")
+    except Exception as e:
+        print(f"Error during GNN optimizer initialization: {e}")
+
     print("Initializing DRL agent...")
-    state_size = 7  # Updated to match the actual state features
-    gnn_embedding_size = GNN_HIDDEN_CHANNELS  # Use the hidden channel size as embedding size
-    agent = ProactiveDRLAgent(state_size, gnn_embedding_size, GNN_HIDDEN_CHANNELS)
-    
+    try:
+        state_size = 9  # Updated to match actual state vector: [energy, x, y, dist_to_sink, hop_count, network_energy, congestion, sleep_state, duty_cycle]
+        gnn_embedding_size = GNN_HIDDEN_CHANNELS
+        agent = ProactiveDRLAgent(state_size, gnn_embedding_size, GNN_HIDDEN_CHANNELS)
+        print("Debug: DRL agent initialized")
+    except Exception as e:
+        print(f"Error during DRL agent initialization: {e}")
+
+    print("Debug: Starting simulation loop")
     # Initialize tracking variables
     network_history = []
     traffic_history = {node['id']: [] for node in network}
@@ -1246,15 +1494,20 @@ def run_proactive_gnn_wsn_simulation():
     gnn_losses = []
     drl_losses = []
     energy_predictions_history = []
-    
+    print("Debug: Tracking variables initialized")
+
     # Initialize round counter
     round_num = 0
-    
+    print("Debug: Round counter initialized")
+
     print(f"Starting simulation with {NUM_NODES} nodes...")
     print(f"Initial network energy: {sum(node['E'] for node in network):.3f}J")
-    
+
+    print("Debug: Entering main simulation loop")
     # Simulation main loop
-    with tqdm(total=MAX_ROUNDS, desc="Simulation Progress") as pbar:
+    print("Creating progress bar...")
+    with tqdm(total=MAX_ROUNDS, desc="Simulation Progress", disable=False) as pbar:
+        print("Progress bar created, starting loop...")
         while round_num < MAX_ROUNDS:
             round_num += 1
             pbar.update(1)
@@ -1354,6 +1607,8 @@ def run_proactive_gnn_wsn_simulation():
                             drl_loss = agent.learn()
                             if drl_loss is not None:
                                 drl_losses.append(drl_loss)
+                    
+                    transmission_count += 1
             
             # Update DRL agent's epsilon
             agent.update_epsilon()
@@ -1550,6 +1805,7 @@ def plot_simulation_results(metrics_history, gnn_losses, drl_losses):
     ax10.grid(True, alpha=0.3)
 
     # Plot 11: DRL Epsilon Decay (Placeholder if not directly in metrics_history)
+
     # This might need to be passed separately or calculated if agent's history is available
     # For now, let's assume it might be added to metrics or we plot a placeholder
     drl_epsilon = [m.get('drl_epsilon', np.nan) for m in metrics_history] # Placeholder
@@ -1591,16 +1847,9 @@ def main():
     print(f"Using device: {device}")
     print("=" * 50)
 
-    # Prompt user for number of rounds
-    try:
-        user_input = input(f"Enter the number of rounds to execute (default {MAX_ROUNDS}): ")
-        num_rounds = int(user_input) if user_input.strip() else MAX_ROUNDS
-        if num_rounds <= 0:
-            print(f"Invalid input. Using default value: {MAX_ROUNDS}")
-            num_rounds = MAX_ROUNDS
-    except Exception:
-        print(f"Invalid input. Using default value: {MAX_ROUNDS}")
-        num_rounds = MAX_ROUNDS
+    # Use default rounds (remove interactive input for now)
+    num_rounds = MAX_ROUNDS
+    print(f"Using {num_rounds} rounds for simulation")
     MAX_ROUNDS = num_rounds
 
     # Create results directory if it doesn't exist
@@ -1611,84 +1860,39 @@ def main():
         # Run simulation
         metrics_history, final_network, final_metrics = run_proactive_gnn_wsn_simulation()
         
-        # Print final summary
-        print("\nSimulation Summary:")
-        print("=" * 50)
-        print(f"Network lifetime: {len(metrics_history)} rounds")
-        print(f"Final alive nodes: {final_metrics['alive_nodes']}/{NUM_NODES} ({final_metrics['alive_percentage']:.1f}%)")
-        print(f"Final network energy: {final_metrics['total_energy']:.3f}J")
-        print(f"Final network connectivity: {final_metrics['sink_connectivity']:.1f}%")
-        print("=" * 50)
+        # Generate and save comprehensive analysis
+        print("\nGenerating comprehensive analysis...")
         
-        # Save simulation timestamp
+        # Save simulation results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        with open('results/simulation_timestamp.txt', 'w') as f:
-            f.write(f"Simulation completed at: {timestamp}\n")
-            f.write(f"Network lifetime: {len(metrics_history)} rounds\n")
         
-        print("\nSimulation completed successfully!")
-        print("Results saved in 'results' directory")
+        # Save final network state
+        final_network_file = f'results/final_network_{timestamp}.json'
+        with open(final_network_file, 'w') as f:
+            json.dump(final_network, f, indent=2, default=str)
         
-        # Print node information table
-        print_node_table(final_network)
+        # Save metrics history
+        metrics_file = f'results/metrics_history_{timestamp}.json'
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics_history, f, indent=2, default=str)
         
-    except Exception as e:
-        print(f"\nError during simulation: {str(e)}")
-        raise
-
-def print_node_table(network):
-    """Print a formatted table with node information"""
-    # Header
-    print("\nNode Information Table")
-    print("=" * 100)
-    print("{:^6} | {:^10} | {:^12} | {:^12} | {:^10} | {:^8} | {:^12} | {:^15}".format(
-        "ID", "Status", "Energy (J)", "Energy (%)", "Role", "Traffic", "Position", "Dist to Sink"
-    ))
-    print("-" * 100)
-    
-    # Sort nodes by ID for better readability
-    sorted_nodes = sorted(network, key=lambda x: x['id'])
-    
-    for node in sorted_nodes:
-        # Calculate energy percentage
-        energy_percent = (node['E'] / node['Eo']) * 100
-        # Get node status
-        status = "Alive" if node['cond'] == 1 else "Dead"
-        # Get node role
-        role = "CH" if node['role'] == 1 else "Node"
-        # Calculate distance to sink
-        dist_to_sink = np.sqrt((node['x'] - SINK_X)**2 + (node['y'] - SINK_Y)**2)
-        # Format position
-        position = f"({node['x']:.1f}, {node['y']:.1f})"
+        # Save final metrics
+        final_metrics_file = f'results/final_metrics_{timestamp}.json'
+        with open(final_metrics_file, 'w') as f:
+            json.dump(final_metrics, f, indent=2, default=str)
         
-        print("{:^6} | {:^10} | {:^12.3f} | {:^12.2f} | {:^10} | {:^8} | {:^12} | {:^15.2f}".format(
-            node['id'],
-            status,
-            node['E'],
-            energy_percent,
-            role,
-            node.get('traffic', 0),
-            position,
-            dist_to_sink
-        ))
-    
-    print("=" * 100)
-    
-    # Print summary statistics
-    alive_nodes = [n for n in network if n['cond'] == 1]
-    print("\nSummary Statistics:")
-    print(f"Total Alive Nodes: {len(alive_nodes)}/{len(network)}")
-    print(f"Average Remaining Energy: {sum(n['E'] for n in network)/len(network):.3f}J")
-    print(f"Total Network Traffic: {sum(n.get('traffic', 0) for n in network)} packets")
-    cluster_heads = [n for n in network if n['role'] == 1 and n['cond'] == 1]
-    print(f"Active Cluster Heads: {len(cluster_heads)}")
-
-if __name__ == "__main__":
-    try:
-        main()
+        print(f"\nSimulation completed successfully!")
+        print(f"Results saved with timestamp: {timestamp}")
+        print(f"Final network lifetime: {final_metrics.get('network_lifetime', 0)} rounds")
+        print(f"Final alive nodes: {final_metrics.get('final_alive_nodes', 0)}/{NUM_NODES}")
+        print(f"Average energy consumption: {final_metrics.get('avg_energy_consumption', 0):.3f}J")
+        
     except KeyboardInterrupt:
-        print("\n\nSimulation interrupted by user.")
+        print("\nSimulation interrupted by user.")
     except Exception as e:
-        print(f"\nAn error occurred: {str(e)}")
+        print(f"\nError during simulation: {e}")
         import traceback
         traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
