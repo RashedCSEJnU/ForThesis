@@ -1,0 +1,2 @@
+Simulation completed at: 20250525_070112
+Network lifetime: 1000 rounds
