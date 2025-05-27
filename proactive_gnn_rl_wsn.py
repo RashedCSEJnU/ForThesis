@@ -335,10 +335,23 @@ class ProactiveDRLAgent:
             
         # Epsilon-greedy action selection
         if random.random() < self.epsilon:
-            # Explore: select random next hop
-            return random.choice(available_nodes)
+            # Explore: select random next hop with some preference for better nodes
+            node_weights = []
+            for node in available_nodes:
+                # Give higher weights to nodes with more energy and better sleep states
+                energy_weight = node['E'] / node['Eo'] if node['Eo'] > 0 else 0.1
+                sleep_weight = 1.0 if node.get('sleep_state') == 'awake' else 0.5
+                weight = energy_weight * sleep_weight
+                node_weights.append(weight)
+            
+            # Weighted random selection during exploration
+            if sum(node_weights) > 0:
+                probabilities = [w / sum(node_weights) for w in node_weights]
+                return np.random.choice(available_nodes, p=probabilities)
+            else:
+                return random.choice(available_nodes)
         else:
-            # Exploit: select node with highest Q-value
+            # Exploit: select node with highest Q-value plus proactive bonuses
             with torch.no_grad():
                 q_values = []
                 # Create network graph to get node mappings
@@ -353,10 +366,11 @@ class ProactiveDRLAgent:
                         node_gnn_embedding = gnn_embedding[node_mapped_id].unsqueeze(0)
                         q_value = self.q_network(node_state, node_gnn_embedding)
                         
-                        # Factor in proactive considerations if network graph is provided
+                        # Enhanced proactive considerations
                         proactive_bonus = 0
+                        
+                        # 1. Network connectivity preservation
                         if network_graph and source_node:
-                            # Calculate how critical this node is to network connectivity
                             try:
                                 # Check if this node is a cut vertex
                                 G = network_graph.copy()
@@ -366,12 +380,40 @@ class ProactiveDRLAgent:
                                     if not paths:
                                         proactive_bonus -= 0.5  # Penalize choosing critical cut vertices
                                 
-                                # Add bonus for nodes with higher predicted future energy
-                                if 'predicted_energy' in node:
-                                    energy_ratio = node['predicted_energy'] / node['E'] if node['E'] > 0 else 0
-                                    proactive_bonus += energy_ratio * 0.2
+                                # Bonus for nodes that improve overall connectivity
+                                original_components = len(list(nx.connected_components(network_graph)))
+                                if original_components > 1:
+                                    # This path could help bridge components
+                                    proactive_bonus += 0.3
                             except:
                                 pass
+                        
+                        # 2. Future energy viability
+                        if 'predicted_energy' in node:
+                            energy_ratio = node['predicted_energy'] / node['E'] if node['E'] > 0 else 0
+                            if energy_ratio > 0.8:  # Predicted to maintain good energy
+                                proactive_bonus += 0.3
+                            elif energy_ratio < 0.5:  # Predicted to lose significant energy
+                                proactive_bonus -= 0.2
+                        
+                        # 3. Load balancing
+                        traffic_load = node.get('traffic', 0)
+                        if traffic_load < 5:  # Low traffic node
+                            proactive_bonus += 0.2
+                        elif traffic_load > 15:  # High traffic node
+                            proactive_bonus -= 0.3
+                        
+                        # 4. Sleep state consideration
+                        if node.get('sleep_state') == 'awake':
+                            proactive_bonus += 0.1
+                        elif node.get('sleep_state') == 'sleep':
+                            proactive_bonus -= 0.4
+                        
+                        # 5. Distance to sink consideration
+                        sink_distance = np.sqrt((node['x'] - SINK_X)**2 + (node['y'] - SINK_Y)**2)
+                        max_distance = np.sqrt(FIELD_X**2 + FIELD_Y**2)
+                        distance_factor = 1 - (sink_distance / max_distance)
+                        proactive_bonus += distance_factor * 0.2
                         
                         q_values.append((node, q_value.item() + proactive_bonus))
                 
@@ -776,6 +818,19 @@ def form_clusters(network, cluster_heads):
             if nearest_ch:
                 node['cluster'] = nearest_ch['id']
                 node['closest'] = nearest_ch['id']
+            else:
+                # If no CH is within range, find the closest one anyway
+                min_actual_distance = float('inf')
+                for ch in cluster_heads:
+                    if ch['cond'] == 1:
+                        distance = np.sqrt((node['x'] - ch['x'])**2 + (node['y'] - ch['y'])**2)
+                        if distance < min_actual_distance:
+                            min_actual_distance = distance
+                            nearest_ch = ch
+                
+                if nearest_ch:
+                    node['cluster'] = nearest_ch['id']
+                    node['closest'] = nearest_ch['id']
 
 
 def predict_traffic_patterns(network, traffic_history, window_size=TRAFFIC_PREDICTION_WINDOW):
@@ -970,147 +1025,363 @@ def update_neighbors_count(network):
 ############################## Training and Inference ##############################
 
 def train_gnn_model(gnn_model, gnn_optimizer, network_history, energy_targets):
-    """Train the GNN model on historical network data"""
+    """Train the GNN model on historical network data with improved loss calculation"""
     if len(network_history) < 2:
         return None
     
     gnn_model.train()
     total_loss = 0
     num_batches = 0
+    total_energy_loss = 0
+    total_topology_loss = 0
     
     # Create training batches from historical data
     for i in range(len(network_history) - 1):
         current_network = network_history[i]
         next_network = network_history[i + 1]
         
-        # Create graph for current state
-        G = create_network_graph(current_network, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
-        if len(G.nodes) == 0:
+        # Filter out dead nodes for cleaner training
+        current_alive = [n for n in current_network if n['cond'] == 1]
+        next_alive = [n for n in next_network if n['cond'] == 1]
+        
+        if len(current_alive) < 2:  # Need at least 2 nodes for meaningful training
             continue
-            
-        pyg_data, node_map = graph_to_pyg_data(G, current_network)
         
-        # Get node embeddings and predictions
-        node_embeddings, node_predictions = gnn_model(pyg_data.x.to(device), 
-                                                     pyg_data.edge_index.to(device),
-                                                     pyg_data.edge_attr.to(device))
-        
-        # Create target energies for next time step
-        target_energies = []
-        for node_id in node_map.keys():
-            if node_id == NUM_NODES:  # Skip sink
+        try:
+            # Create graph for current state
+            G = create_network_graph(current_alive, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
+            if len(G.nodes) == 0:
                 continue
-            next_node = next((n for n in next_network if n['id'] == node_id), None)
-            if next_node:
-                target_energies.append(next_node['E'] / INITIAL_ENERGY_MAX)
-        
-        if len(target_energies) == 0:
+                
+            pyg_data, node_map = graph_to_pyg_data(G, current_alive)
+            
+            if pyg_data.x.size(0) == 0:  # Empty graph
+                continue
+            
+            # Get node embeddings and predictions
+            node_embeddings, graph_embedding = gnn_model(pyg_data.x.to(device), 
+                                                         pyg_data.edge_index.to(device),
+                                                         pyg_data.edge_attr.to(device))
+            
+            # Create target energies for next time step
+            target_energies = []
+            valid_node_indices = []
+            
+            for idx, (node_id, mapped_idx) in enumerate(node_map.items()):
+                if node_id == NUM_NODES:  # Skip sink
+                    continue
+                    
+                # Find corresponding node in next network state
+                next_node = next((n for n in next_alive if n['id'] == node_id), None)
+                if next_node and mapped_idx < len(current_alive):
+                    # Normalize energy to [0,1] range
+                    normalized_energy = next_node['E'] / INITIAL_ENERGY_MAX
+                    target_energies.append(normalized_energy)
+                    valid_node_indices.append(mapped_idx)
+            
+            if len(target_energies) == 0 or len(valid_node_indices) == 0:
+                continue
+                
+            target_energies = torch.tensor(target_energies, dtype=torch.float32).to(device)
+            
+            # Get energy predictions for valid nodes
+            valid_embeddings = node_embeddings[valid_node_indices]
+            valid_features = pyg_data.x[valid_node_indices]
+            
+            energy_predictions = gnn_model.predict_energy(valid_embeddings, valid_features)
+            
+            # Energy prediction loss
+            if energy_predictions.shape[0] == target_energies.shape[0]:
+                energy_loss = F.mse_loss(energy_predictions[:, 0], target_energies)
+                
+                # Add L2 regularization for better generalization
+                l2_reg = 0.0
+                for param in gnn_model.parameters():
+                    l2_reg += torch.norm(param)
+                
+                # Topology preservation loss (encourage similar embeddings for similar nodes)
+                topology_loss = 0.0
+                if node_embeddings.size(0) > 1:
+                    # Compute pairwise distances in embedding space
+                    embedding_dists = torch.cdist(node_embeddings, node_embeddings)
+                    
+                    # Compute pairwise distances in feature space (energy, position)
+                    feature_dists = torch.cdist(pyg_data.x[:, :3], pyg_data.x[:, :3])  # Use first 3 features
+                    
+                    # Encourage embeddings to preserve feature space relationships
+                    topology_loss = F.mse_loss(embedding_dists, feature_dists) * 0.1
+                
+                # Combined loss with regularization
+                total_batch_loss = energy_loss + topology_loss + l2_reg * 1e-4
+                
+                # Backpropagation
+                gnn_optimizer.zero_grad()
+                total_batch_loss.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), 1.0)
+                gnn_optimizer.step()
+                
+                total_loss += total_batch_loss.item()
+                total_energy_loss += energy_loss.item()
+                total_topology_loss += topology_loss.item() if isinstance(topology_loss, torch.Tensor) else topology_loss
+                num_batches += 1
+                
+        except Exception as e:
+            print(f"Error in GNN training batch {i}: {e}")
             continue
-            
-        target_energies = torch.tensor(target_energies, dtype=torch.float32).to(device)
-        
-        # Predict future energy levels
-        node_features = pyg_data.x[:len(target_energies)]  # Exclude sink
-        energy_predictions = gnn_model.predict_energy(node_embeddings[:len(target_energies)], 
-                                                     node_features)
-        
-        # Calculate loss (predict next round energy)
-        if energy_predictions.shape[0] == target_energies.shape[0]:
-            loss = F.mse_loss(energy_predictions[:, 0], target_energies)
-            
-            # Backpropagation
-            gnn_optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), 1.0)
-            gnn_optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
     
-    return total_loss / num_batches if num_batches > 0 else None
+    if num_batches > 0:
+        avg_loss = total_loss / num_batches
+        avg_energy_loss = total_energy_loss / num_batches
+        avg_topology_loss = total_topology_loss / num_batches
+        
+        # Print detailed loss information
+        if num_batches % 5 == 0:  # Print every 5th training iteration
+            print(f"GNN Training - Total Loss: {avg_loss:.6f}, Energy Loss: {avg_energy_loss:.6f}, Topology Loss: {avg_topology_loss:.6f}")
+        
+        return avg_loss
+    
+    return None
 
 def predict_future_energies(gnn_model, network, prediction_horizon=PREDICTION_HORIZON):
-    """Predict future energy levels for all nodes"""
+    """Predict future energy levels for all nodes with multi-step prediction"""
     gnn_model.eval()
     predictions = {}
+    
     # Create current network graph
-    G = create_network_graph(network, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
+    alive_nodes = [n for n in network if n['cond'] == 1]
+    if len(alive_nodes) == 0:
+        return predictions
+        
+    G = create_network_graph(alive_nodes, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
     if len(G.nodes) == 0:
         return predictions
-    pyg_data, node_map = graph_to_pyg_data(G, network)
-    with torch.no_grad():
-        # Get embeddings
-        node_embeddings, _ = gnn_model(pyg_data.x.to(device), 
-                                     pyg_data.edge_index.to(device),
-                                     pyg_data.edge_attr.to(device))
-        # Predict future energies
-        for node_id, mapped_id in node_map.items():
-            if node_id == NUM_NODES:  # Skip sink
-                continue
-            node = next((n for n in network if n['id'] == node_id), None)
-            if not node:
-                continue
-            node_features = pyg_data.x[mapped_id].unsqueeze(0)
-            node_embedding = node_embeddings[mapped_id].unsqueeze(0)
-            energy_pred = gnn_model.predict_energy(node_embedding, node_features)
-            # Use the predicted value for all future steps (since model is single-step)
-            pred_energy = energy_pred[0, 0].item() * INITIAL_ENERGY_MAX
-            predicted_energies = [max(0, pred_energy)] * prediction_horizon
-            predictions[node_id] = predicted_energies
+        
+    try:
+        pyg_data, node_map = graph_to_pyg_data(G, alive_nodes)
+        
+        with torch.no_grad():
+            # Get embeddings
+            node_embeddings, graph_embedding = gnn_model(pyg_data.x.to(device), 
+                                         pyg_data.edge_index.to(device),
+                                         pyg_data.edge_attr.to(device))
             
-            # Update node's predicted energy (average of future predictions)
-            node['predicted_energy'] = sum(predicted_energies) / len(predicted_energies)
+            # Multi-step energy prediction
+            for node_id, mapped_id in node_map.items():
+                if node_id == NUM_NODES:  # Skip sink
+                    continue
+                    
+                node = next((n for n in alive_nodes if n['id'] == node_id), None)
+                if not node:
+                    continue
+                    
+                predicted_energies = []
+                current_energy = node['E']
+                
+                # Predict energy for each step in the horizon
+                for step in range(prediction_horizon):
+                    if mapped_id < node_embeddings.size(0):
+                        # Create modified node features for this prediction step
+                        node_features = pyg_data.x[mapped_id].clone().unsqueeze(0)
+                        
+                        # Update energy feature with current predicted energy
+                        normalized_energy = current_energy / INITIAL_ENERGY_MAX
+                        node_features[0, 0] = normalized_energy  # First feature is energy
+                        
+                        node_embedding = node_embeddings[mapped_id].unsqueeze(0)
+                        energy_pred = gnn_model.predict_energy(node_embedding, node_features)
+                        
+                        # Convert back to actual energy value
+                        pred_energy = energy_pred[0, 0].item() * INITIAL_ENERGY_MAX
+                        
+                        # Apply energy decay based on typical consumption patterns
+                        decay_factor = 0.95 ** step  # Gradual decay over time
+                        traffic_factor = 1 - (node.get('traffic', 0) / 100) * 0.1  # Traffic impact
+                        sleep_factor = 1.0 if node.get('sleep_state') == 'sleep' else 0.9  # Sleep savings
+                        
+                        pred_energy = max(0, pred_energy * decay_factor * traffic_factor * sleep_factor)
+                        predicted_energies.append(pred_energy)
+                        current_energy = pred_energy  # Use predicted energy for next step
+                    else:
+                        # Fallback prediction based on current consumption rate
+                        consumption_rate = (node['Eo'] - node['E']) / max(1, node.get('round', 1))
+                        pred_energy = max(0, current_energy - consumption_rate * (step + 1))
+                        predicted_energies.append(pred_energy)
+                        current_energy = pred_energy
+                
+                predictions[node_id] = predicted_energies
+                
+                # Update node's predicted energy (weighted average of future predictions)
+                if predicted_energies:
+                    weights = [0.5 ** i for i in range(len(predicted_energies))]  # Exponential decay weights
+                    weighted_avg = sum(p * w for p, w in zip(predicted_energies, weights)) / sum(weights)
+                    node['predicted_energy'] = weighted_avg
+                    
+                    # Add confidence measure based on variance
+                    if len(predicted_energies) > 1:
+                        variance = np.var(predicted_energies)
+                        node['prediction_confidence'] = max(0, 1 - variance / (INITIAL_ENERGY_MAX ** 2))
+                    else:
+                        node['prediction_confidence'] = 0.5
+                        
+    except Exception as e:
+        print(f"Error in energy prediction: {e}")
+        # Fallback to simple energy prediction
+        for node in alive_nodes:
+            if node['id'] != NUM_NODES:
+                current_energy = node['E']
+                fallback_predictions = []
+                for step in range(prediction_horizon):
+                    # Simple linear decay prediction
+                    consumption_rate = (node['Eo'] - node['E']) / max(1, node.get('round', 1))
+                    pred_energy = max(0, current_energy - consumption_rate * (step + 1))
+                    fallback_predictions.append(pred_energy)
+                predictions[node['id']] = fallback_predictions
+                node['predicted_energy'] = sum(fallback_predictions) / len(fallback_predictions)
+                node['prediction_confidence'] = 0.3  # Lower confidence for fallback
     
     return predictions
 
 def calculate_reward(path, energy_consumed, network, sink_pos):
-    """Calculate reward for DRL agent based on path quality and proactive metrics"""
-    if not path:
+    """Calculate sophisticated reward for DRL agent based on multiple factors"""
+    if not path or len(path) == 0:
         return -100  # Large penalty for failed routing
     
-    # Base reward components
-    energy_efficiency = 1 / (energy_consumed + 1e-6)  # Higher reward for lower energy consumption
-    path_length_penalty = len(path) / NUM_NODES  # Penalty for longer paths
+    # Base metrics
+    path_length = len(path)
+    alive_nodes = [node for node in network if node['cond'] == 1]
+    total_nodes = len(network)
     
-    # Network connectivity preservation
-    connectivity_bonus = 0
-    total_energy = sum(node['E'] for node in network if node['cond'] == 1)
-    network_energy_ratio = total_energy / (NUM_NODES * INITIAL_ENERGY_MAX)
-    connectivity_bonus = network_energy_ratio * 10
+    if len(alive_nodes) == 0:
+        return -100
     
-    # Load balancing reward
-    load_balance_reward = 0
+    # 1. Energy Efficiency Reward (40% weight)
+    energy_efficiency = 1 / (energy_consumed + 1e-6)
+    normalized_energy_efficiency = min(10, energy_efficiency)  # Cap the reward
+    energy_reward = normalized_energy_efficiency * 4.0
+    
+    # 2. Path Length Penalty (15% weight) 
+    optimal_path_length = max(1, np.ceil(path[-1]['dts'] / TRANSMISSION_RANGE))
+    path_efficiency = optimal_path_length / max(1, path_length)
+    path_reward = path_efficiency * 1.5
+    
+    # 3. Network Longevity Reward (25% weight)
+    total_energy = sum(node['E'] for node in alive_nodes)
+    max_possible_energy = len(alive_nodes) * INITIAL_ENERGY_MAX
+    network_energy_ratio = total_energy / max_possible_energy if max_possible_energy > 0 else 0
+    
+    # Bonus for preserving high-energy nodes
+    min_energy_in_path = min(node['E'] for node in path)
+    avg_energy_in_path = sum(node['E'] for node in path) / len(path)
+    energy_preservation = (min_energy_in_path / INITIAL_ENERGY_MAX) * 0.5 + \
+                         (avg_energy_in_path / INITIAL_ENERGY_MAX) * 0.5
+    
+    longevity_reward = (network_energy_ratio + energy_preservation) * 1.25
+    
+    # 4. Load Balancing Reward (10% weight)
     if len(path) > 1:
-        # Check if path uses diverse routes (less congested nodes)
-        avg_traffic = sum(node.get('traffic', 0) for node in path) / len(path)
-        max_traffic = max(node.get('traffic', 0) for node in network if node['cond'] == 1)
-        if max_traffic > 0:
-            load_balance_reward = (1 - avg_traffic / max_traffic) * 5
+        # Reward paths that use nodes with lower traffic
+        path_traffic = [node.get('traffic', 0) for node in path]
+        avg_path_traffic = sum(path_traffic) / len(path_traffic)
+        max_network_traffic = max(node.get('traffic', 0) for node in alive_nodes)
+        
+        if max_network_traffic > 0:
+            traffic_balance = 1 - (avg_path_traffic / max_network_traffic)
+        else:
+            traffic_balance = 1.0
+        
+        load_balance_reward = traffic_balance * 1.0
+    else:
+        load_balance_reward = 0.5
     
-    # Future viability reward (based on predicted energies)
-    future_viability_reward = 0
+    # 5. Future Viability Reward (15% weight)
+    future_viability = 0
+    prediction_bonus = 0
+    
     for node in path:
+        # Current energy ratio
+        current_ratio = node['E'] / node['Eo'] if node['Eo'] > 0 else 0
+        
+        # Predicted future energy ratio
         predicted_energy = node.get('predicted_energy', node['E'])
-        current_energy = node['E']
-        if current_energy > 0:
-            future_ratio = predicted_energy / current_energy
-            future_viability_reward += future_ratio
-    future_viability_reward = (future_viability_reward / len(path)) * 5
+        if node['E'] > 0:
+            future_ratio = predicted_energy / node['E']
+            prediction_confidence = node.get('prediction_confidence', 0.5)
+            
+            # Weighted future viability
+            future_viability += (current_ratio * 0.6 + future_ratio * 0.4) * prediction_confidence
+        else:
+            future_viability += current_ratio
+        
+        # Bonus for high-confidence predictions of stable energy
+        if node.get('prediction_confidence', 0) > 0.7 and predicted_energy > node['E'] * 0.8:
+            prediction_bonus += 0.1
     
-    # Distance to sink factor
+    future_viability = (future_viability / len(path)) if len(path) > 0 else 0
+    future_reward = (future_viability + prediction_bonus) * 1.5
+    
+    # 6. Connectivity Preservation Bonus (10% weight)
+    connectivity_bonus = 0
+    
+    # Check if path maintains good connectivity to sink
     final_node = path[-1]
     distance_to_sink = np.sqrt((final_node['x'] - sink_pos[0])**2 + 
                               (final_node['y'] - sink_pos[1])**2)
-    distance_reward = (TRANSMISSION_RANGE - distance_to_sink) / TRANSMISSION_RANGE * 2
     
-    # Combine all reward components
-    total_reward = (10 * energy_efficiency +
-                   connectivity_bonus +
-                   load_balance_reward +
-                   future_viability_reward +
-                   distance_reward)
+    if distance_to_sink <= TRANSMISSION_RANGE:
+        connectivity_bonus += 1.0  # Direct connection to sink
+    elif distance_to_sink <= TRANSMISSION_RANGE * 2:
+        connectivity_bonus += 0.5  # Close to sink
     
-    return max(-100, min(100, total_reward))  # Clamp reward to reasonable range
+    # Bonus for nodes that improve overall connectivity
+    original_components = len(list(nx.connected_components(create_network_graph(network, sink_pos, TRANSMISSION_RANGE))))
+    if original_components > 1:
+        # This path could help bridge components
+        connectivity_bonus += 0.3
+    
+    connectivity_reward = connectivity_bonus * 1.0
+    
+    # 7. Sleep Scheduling Efficiency Bonus (5% weight)
+    sleep_bonus = 0
+    awake_nodes_in_path = sum(1 for node in path if node.get('sleep_state') == 'awake')
+    sleep_efficiency = awake_nodes_in_path / len(path) if len(path) > 0 else 0
+    sleep_bonus = sleep_efficiency * 0.5
+    
+    # 8. Network Health Penalty/Bonus
+    network_health = len(alive_nodes) / total_nodes
+    if network_health < 0.3:
+        health_penalty = -2.0  # Severe penalty for degraded network
+    elif network_health < 0.5:
+        health_penalty = -1.0  # Moderate penalty
+    elif network_health > 0.8:
+        health_penalty = 1.0   # Bonus for healthy network
+    else:
+        health_penalty = 0
+    
+    # Combine all rewards with weights
+    total_reward = (
+        energy_reward * 0.40 +           # Energy efficiency (40%)
+        path_reward * 0.15 +             # Path efficiency (15%)
+        longevity_reward * 0.25 +        # Network longevity (25%)
+        load_balance_reward * 0.10 +     # Load balancing (10%)
+        future_reward * 0.15 +           # Future viability (15%)
+        connectivity_reward * 0.10 +     # Connectivity (10%)
+        sleep_bonus * 0.05 +             # Sleep efficiency (5%)
+        health_penalty                   # Network health adjustment
+    )
+    
+    # Apply additional penalties for edge cases
+    if energy_consumed > INITIAL_ENERGY_MAX:
+        total_reward -= 5.0  # Penalty for excessive energy consumption
+    
+    if path_length > NUM_NODES / 2:
+        total_reward -= 2.0  # Penalty for very long paths
+    
+    # Final clamping to reasonable range
+    final_reward = max(-50, min(50, total_reward))
+    
+    return final_reward
 
 def update_dead_nodes(network):
     """Update dead nodes status"""
@@ -1322,8 +1593,268 @@ def visualize_network(network, round_num, sink_pos, save_plot=True, recent_paths
         plt.close()
     else:
         plt.show()
+        plt.close()
 
-############################## Helper Functions ##############################
+############################## Advanced Network Analysis ##############################
+
+def analyze_network_topology(network, round_num):
+    """Perform advanced topology analysis for network optimization"""
+    alive_nodes = [node for node in network if node['cond'] == 1]
+    if len(alive_nodes) < 2:
+        return {}
+    
+    # Create network graph for analysis
+    G = create_network_graph(alive_nodes, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
+    
+    analysis = {
+        'round': round_num,
+        'total_nodes': len(alive_nodes),
+        'total_edges': G.number_of_edges(),
+        'avg_degree': sum(dict(G.degree()).values()) / len(G.nodes()) if len(G.nodes()) > 0 else 0,
+        'network_density': nx.density(G) if len(G.nodes()) > 1 else 0,
+        'clustering_coefficient': nx.average_clustering(G) if len(G.nodes()) > 2 else 0,
+        'connected_components': nx.number_connected_components(G),
+        'largest_component_size': len(max(nx.connected_components(G), key=len)) if len(G.nodes()) > 0 else 0
+    }
+    
+    # Analyze connectivity to sink
+    if NUM_NODES in G.nodes:
+        nodes_connected_to_sink = 0
+        shortest_paths_to_sink = []
+        
+        for node_id in G.nodes():
+            if node_id != NUM_NODES and nx.has_path(G, node_id, NUM_NODES):
+                nodes_connected_to_sink += 1
+                try:
+                    path_length = nx.shortest_path_length(G, node_id, NUM_NODES)
+                    shortest_paths_to_sink.append(path_length)
+                except:
+                    pass
+        
+        analysis['sink_connected_nodes'] = nodes_connected_to_sink
+        analysis['sink_connectivity_ratio'] = nodes_connected_to_sink / len(alive_nodes) if alive_nodes else 0
+        analysis['avg_path_to_sink'] = np.mean(shortest_paths_to_sink) if shortest_paths_to_sink else float('inf')
+        analysis['max_path_to_sink'] = max(shortest_paths_to_sink) if shortest_paths_to_sink else float('inf')
+    
+    # Find critical nodes (cut vertices)
+    cut_vertices = list(nx.articulation_points(G))
+    analysis['critical_nodes'] = len(cut_vertices)
+    analysis['critical_node_ratio'] = len(cut_vertices) / len(alive_nodes) if alive_nodes else 0
+    
+    # Energy distribution analysis
+    energies = [node['E'] for node in alive_nodes]
+    analysis['energy_std'] = np.std(energies)
+    analysis['energy_cv'] = np.std(energies) / np.mean(energies) if np.mean(energies) > 0 else 0
+    analysis['energy_gini'] = calculate_gini_coefficient(energies)
+    
+    # Traffic load analysis
+    traffic_loads = [node.get('traffic', 0) for node in alive_nodes]
+    analysis['traffic_std'] = np.std(traffic_loads)
+    analysis['max_traffic_load'] = max(traffic_loads) if traffic_loads else 0
+    analysis['traffic_imbalance'] = calculate_gini_coefficient(traffic_loads)
+    
+    # Sleep scheduling efficiency
+    if ENABLE_SLEEP_SCHEDULING:
+        awake_nodes = sum(1 for node in alive_nodes if node.get('sleep_state') == 'awake')
+        sleep_nodes = sum(1 for node in alive_nodes if node.get('sleep_state') == 'sleep')
+        listen_nodes = sum(1 for node in alive_nodes if node.get('sleep_state') == 'listen')
+        
+        analysis['sleep_efficiency'] = sleep_nodes / len(alive_nodes) if alive_nodes else 0
+        analysis['awake_ratio'] = awake_nodes / len(alive_nodes) if alive_nodes else 0
+        analysis['listen_ratio'] = listen_nodes / len(alive_nodes) if alive_nodes else 0
+        
+        # Calculate energy savings from sleep scheduling
+        estimated_savings = calculate_sleep_energy_savings(network)
+        analysis['sleep_energy_savings'] = estimated_savings
+    
+    return analysis
+
+def calculate_gini_coefficient(values):
+    """Calculate Gini coefficient for measuring inequality"""
+    if len(values) == 0:
+        return 0
+    
+    # Sort values
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    
+    # Calculate Gini coefficient
+    index = np.arange(1, n + 1)
+    gini = (2 * np.sum(index * sorted_values)) / (n * np.sum(sorted_values)) - (n + 1) / n
+    return gini if not np.isnan(gini) else 0
+
+def detect_network_bottlenecks(network, traffic_threshold=10):
+    """Detect potential network bottlenecks based on traffic and topology"""
+    alive_nodes = [node for node in network if node['cond'] == 1]
+    G = create_network_graph(alive_nodes, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
+    
+    bottlenecks = []
+    
+    for node in alive_nodes:
+        bottleneck_score = 0
+        
+        # High traffic load
+        traffic = node.get('traffic', 0)
+        if traffic > traffic_threshold:
+            bottleneck_score += traffic / traffic_threshold
+        
+        # Critical node (articulation point)
+        if node['id'] in nx.articulation_points(G):
+            bottleneck_score += 2.0
+        
+        # Low energy with high degree
+        degree = G.degree(node['id']) if node['id'] in G.nodes else 0
+        energy_ratio = node['E'] / node['Eo'] if node['Eo'] > 0 else 0
+        if degree > 3 and energy_ratio < 0.3:
+            bottleneck_score += 1.5
+        
+        # Cluster head with high load
+        if node.get('role') == 1 and traffic > 5:
+            bottleneck_score += 1.0
+        
+        if bottleneck_score > 2.0:
+            bottlenecks.append({
+                'node_id': node['id'],
+                'score': bottleneck_score,
+                'traffic': traffic,
+                'energy_ratio': energy_ratio,
+                'degree': degree,
+                'role': node.get('role', 0)
+            })
+    
+    return sorted(bottlenecks, key=lambda x: x['score'], reverse=True)
+
+def predict_network_lifetime(network, current_round, consumption_history):
+    """Predict remaining network lifetime based on current trends"""
+    alive_nodes = [node for node in network if node['cond'] == 1]
+    if len(alive_nodes) == 0:
+        return 0
+    
+    # Calculate average energy consumption rate
+    if len(consumption_history) >= 5:
+        recent_consumption = consumption_history[-5:]
+        avg_consumption_rate = np.mean(recent_consumption)
+    else:
+        # Estimate based on current energy levels
+        total_consumed = sum(node['Eo'] - node['E'] for node in alive_nodes)
+        avg_consumption_rate = total_consumed / max(1, current_round)
+    
+    # Predict when first node will die
+    min_energy = min(node['E'] for node in alive_nodes)
+    if avg_consumption_rate > 0:
+        rounds_until_first_death = min_energy / avg_consumption_rate
+    else:
+        rounds_until_first_death = float('inf')
+    
+    # Predict when network becomes disconnected
+    node_energies = [(node['E'], node['id']) for node in alive_nodes]
+    node_energies.sort()  # Sort by energy level
+    
+    predicted_deaths = []
+    for energy, node_id in node_energies:
+        if avg_consumption_rate > 0:
+            death_round = current_round + (energy / avg_consumption_rate)
+            predicted_deaths.append((death_round, node_id))
+    
+    # Simulate network connectivity as nodes die
+    connectivity_loss_round = float('inf')
+    G = create_network_graph(alive_nodes, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
+    
+    for death_round, node_id in predicted_deaths:
+        if node_id in G.nodes:
+            G.remove_node(node_id)
+            if NUM_NODES in G.nodes:
+                # Check if sink is still reachable by majority of nodes
+                connected_to_sink = sum(1 for n in G.nodes() 
+                                      if n != NUM_NODES and nx.has_path(G, n, NUM_NODES))
+                total_remaining = len([n for n in G.nodes() if n != NUM_NODES])
+                
+                if total_remaining > 0 and connected_to_sink / total_remaining < 0.5:
+                    connectivity_loss_round = death_round
+                    break
+    
+    return {
+        'first_node_death': rounds_until_first_death,
+        'connectivity_loss': connectivity_loss_round,
+        'avg_consumption_rate': avg_consumption_rate,
+        'predicted_deaths': predicted_deaths[:10]  # Top 10 nodes likely to die first
+    }
+
+def optimize_cluster_head_placement(network, energy_predictions=None):
+    """Optimize cluster head placement based on energy predictions and topology"""
+    alive_nodes = [node for node in network if node['cond'] == 1]
+    if len(alive_nodes) < 2:
+        return []
+    
+    # Calculate optimal number of CHs based on network size and connectivity
+    optimal_ch_count = max(1, int(np.sqrt(len(alive_nodes)) * 0.8))
+    
+    # Score each node for CH suitability
+    ch_candidates = []
+    
+    for node in alive_nodes:
+        score = 0
+        
+        # Energy factor (40% weight)
+        energy_ratio = node['E'] / node['Eo'] if node['Eo'] > 0 else 0
+        score += energy_ratio * 0.4
+        
+        # Position factor (20% weight) - prefer central locations
+        center_x, center_y = FIELD_X / 2, FIELD_Y / 2
+        distance_to_center = np.sqrt((node['x'] - center_x)**2 + (node['y'] - center_y)**2)
+        max_distance = np.sqrt((FIELD_X/2)**2 + (FIELD_Y/2)**2)
+        centrality_score = 1 - (distance_to_center / max_distance)
+        score += centrality_score * 0.2
+        
+        # Connectivity factor (25% weight) - prefer well-connected nodes
+        neighbors = sum(1 for other in alive_nodes 
+                       if other['id'] != node['id'] and
+                       np.sqrt((node['x'] - other['x'])**2 + (node['y'] - other['y'])**2) <= TRANSMISSION_RANGE)
+        connectivity_score = min(1.0, neighbors / 5)  # Normalize to max 5 neighbors
+        score += connectivity_score * 0.25
+        
+        # Future energy factor (10% weight)
+        if energy_predictions and node['id'] in energy_predictions:
+            future_energies = energy_predictions[node['id']]
+            if future_energies:
+                avg_future_energy = np.mean(future_energies)
+                future_ratio = min(2.0, avg_future_energy / node['E']) if node['E'] > 0 else 0
+                score += (future_ratio / 2.0) * 0.1
+        
+        # Traffic factor (5% weight) - prefer nodes with lower current traffic
+        traffic_penalty = min(1.0, node.get('traffic', 0) / 20)
+        score += (1 - traffic_penalty) * 0.05
+        
+        ch_candidates.append((node, score))
+    
+    # Select top candidates
+    ch_candidates.sort(key=lambda x: x[1], reverse=True)
+    selected_chs = [candidate[0] for candidate in ch_candidates[:optimal_ch_count]]
+    
+    # Ensure geographical distribution
+    final_chs = []
+    min_distance_between_chs = TRANSMISSION_RANGE * 1.5
+    
+    for ch in selected_chs:
+        too_close = False
+        for existing_ch in final_chs:
+            distance = np.sqrt((ch['x'] - existing_ch['x'])**2 + (ch['y'] - existing_ch['y'])**2)
+            if distance < min_distance_between_chs:
+                too_close = True
+                break
+        
+        if not too_close:
+            final_chs.append(ch)
+        
+        if len(final_chs) >= optimal_ch_count:
+            break
+    
+    # If we don't have enough CHs due to distance constraints, add more from candidates
+    if len(final_chs) < max(1, optimal_ch_count // 2):
+        remaining_candidates = [ch for ch in selected_chs if ch not in final_chs]
+        final_chs.extend(remaining_candidates[:optimal_ch_count - len(final_chs)])
+    
+    return final_chs
 
 def find_optimal_path_drl(source_node, sink_pos, network, agent, gnn_model, network_graph=None):
     """Find optimal path using DRL agent with GNN embeddings"""
@@ -1449,9 +1980,265 @@ def update_energy_after_transmission(network, path, energy_consumed):
                 if network_node['E'] <= DEAD_NODE_THRESHOLD:
                     network_node['cond'] = 0
 
-############################## Main Simulation ##############################
+############################## Plotting Functions ##############################
+
+def plot_simulation_results(metrics_history, gnn_losses, drl_losses):
+    """Plot comprehensive simulation results"""
+    rounds = [m['round'] for m in metrics_history]
+    
+    # Create subplots with additional metrics
+    fig, axes = plt.subplots(6, 2, figsize=(18, 24))  # Increased rows for more plots
+    ax1, ax2 = axes[0]
+    ax3, ax4 = axes[1]
+    ax5, ax6 = axes[2]
+    ax7, ax8 = axes[3]
+    ax9, ax10 = axes[4]  # New row for plots
+    ax11, ax12 = axes[5]  # New row for plots
+    
+    # Plot 1: Network lifetime (alive nodes over time)
+    alive_percentages = [m['alive_percentage'] for m in metrics_history]
+    ax1.plot(rounds, alive_percentages, 'b-', linewidth=2)
+    ax1.set_xlabel('Round')
+    ax1.set_ylabel('Alive Nodes (%)')
+    ax1.set_title('Network Lifetime')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Energy consumption
+    avg_energies = [m['avg_energy'] for m in metrics_history]
+    total_energies = [m['total_energy'] for m in metrics_history]
+    ax2.plot(rounds, avg_energies, 'g-', label='Average Energy', linewidth=2)
+    ax2.plot(rounds, total_energies, 'r--', label='Total Energy', linewidth=2)
+    ax2.set_xlabel('Round')
+    ax2.set_ylabel('Energy (J)')
+    ax2.set_title('Network Energy Consumption')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Network connectivity
+    connectivity = [m['sink_connectivity'] for m in metrics_history]
+    ax3.plot(rounds, connectivity, 'm-', linewidth=2)
+    ax3.set_xlabel('Round')
+    ax3.set_ylabel('Sink Connectivity (%)')
+    ax3.set_title('Network Connectivity')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Traffic distribution
+    avg_traffic = [m['avg_traffic'] for m in metrics_history]
+    ax4.plot(rounds, avg_traffic, 'c-', linewidth=2)
+    ax4.set_xlabel('Round')
+    ax4.set_ylabel('Average Traffic')
+    ax4.set_title('Traffic Distribution')
+    ax4.grid(True, alpha=0.3)
+    
+    # Plot 5: GNN training loss
+    if gnn_losses:
+        ax5.plot(range(len(gnn_losses)), gnn_losses, 'y-', linewidth=2)
+        ax5.set_xlabel('Training Iterations')
+        ax5.set_ylabel('Loss')
+        ax5.set_title('GNN Training Loss')
+        ax5.grid(True, alpha=0.3)
+    
+    # Plot 6: DRL training loss
+    if drl_losses:
+        ax6.plot(range(len(drl_losses)), drl_losses, 'k-', linewidth=2)
+        ax6.set_xlabel('Training Iterations')
+        ax6.set_ylabel('Loss')
+        ax6.set_title('DRL Training Loss')
+        ax6.grid(True, alpha=0.3)
+    
+    # Plot 7: First Node Death Time
+    first_death = None
+    for m in metrics_history:
+        if m['alive_nodes'] < NUM_NODES:
+            first_death = m['round']
+            break
+    if first_death:
+        ax7.axvline(x=first_death, color='r', linestyle='--', label=f'First Death at Round {first_death}')
+    ax7.plot(rounds, [m['alive_nodes'] for m in metrics_history], 'b-', linewidth=2)
+    ax7.set_xlabel('Round')
+    ax7.set_ylabel('Number of Alive Nodes')
+    ax7.set_title('First Node Death Time')
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+    
+    # Plot 8: Network Throughput
+    # Calculate throughput as successful packet transmissions per round
+    throughput = []
+    for m in metrics_history:
+        # Calculate total bits transmitted in this round
+        bits_per_round = m['total_traffic'] * PACKET_SIZE  # bits per round
+        throughput.append(bits_per_round)  # bits per round
+    
+    ax8.plot(rounds, throughput, 'g-', linewidth=2)
+    ax8.set_xlabel('Round')
+    ax8.set_ylabel('Throughput (bits/round)')
+    ax8.set_title('Network Throughput')
+    ax8.ticklabel_format(style='sci', axis='y', scilimits=(0,0))  # Use scientific notation for y-axis
+    ax8.grid(True, alpha=0.3)
+
+    # Plot 9: Energy Variance
+    energy_variance = [m.get('energy_variance', 0) for m in metrics_history]  # Use .get for safety
+    ax9.plot(rounds, energy_variance, 'p-', linewidth=2, label='Energy Variance')
+    ax9.set_xlabel('Round')
+    ax9.set_ylabel('Energy Variance (J^2)')
+    ax9.set_title('Energy Variance Over Time')
+    ax9.legend()
+    ax9.grid(True, alpha=0.3)
+
+    # Plot 10: Number of Active Cluster Heads
+    # Assuming 'num_cluster_heads' is or will be added to metrics
+    num_cluster_heads = [m.get('num_cluster_heads', np.nan) for m in metrics_history]  # Use np.nan for missing data
+    ax10.plot(rounds, num_cluster_heads, 's-', linewidth=2, label='Active Cluster Heads')
+    ax10.set_xlabel('Round')
+    ax10.set_ylabel('Number of Cluster Heads')
+    ax10.set_title('Active Cluster Heads Over Time')
+    ax10.legend()
+    ax10.grid(True, alpha=0.3)
+
+    # Plot 11: DRL Epsilon Decay (Placeholder if not directly in metrics_history)
+    # This might need to be passed separately or calculated if agent's history is available
+    # For now, let's assume it might be added to metrics or we plot a placeholder
+    drl_epsilon = [m.get('drl_epsilon', np.nan) for m in metrics_history]  # Placeholder
+    ax11.plot(rounds, drl_epsilon, 'd-', linewidth=2, label='DRL Epsilon')
+    ax11.set_xlabel('Round')
+    ax11.set_ylabel('Epsilon Value')
+    ax11.set_title('DRL Agent Epsilon Decay')
+    ax11.legend()
+    ax11.grid(True, alpha=0.3)
+
+    # Plot 12: Node Role Distribution (Placeholder - requires more data from metrics)
+    # This would typically be a stacked bar or area chart.
+    # For simplicity, if 'roles_distribution' (e.g., {'ch': count, 'member': count}) is in metrics:
+    # ch_counts = [m.get('roles_distribution', {}).get('ch', 0) for m in metrics_history]
+    # member_counts = [m.get('roles_distribution', {}).get('member', 0) for m in metrics_history]
+    # ax12.stackplot(rounds, ch_counts, member_counts, labels=['Cluster Heads', 'Member Nodes'], alpha=0.7)
+    ax12.text(0.5, 0.5, 'Node Role Distribution (Placeholder)', horizontalalignment='center', verticalalignment='center', transform=ax12.transAxes)
+    ax12.set_xlabel('Round')
+    ax12.set_ylabel('Number of Nodes')
+    ax12.set_title('Node Role Distribution Over Time')
+    ax12.legend()
+    ax12.grid(True, alpha=0.3)
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig('results/performance_metrics.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_advanced_analysis(topology_analysis_history, bottleneck_history, consumption_history):
+    """Plot advanced network analysis results"""
+    if not topology_analysis_history:
+        print("No topology analysis data available for plotting")
+        return
+    
+    # Create figure with subplots for advanced analysis
+    fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+    ax1, ax2 = axes[0]
+    ax3, ax4 = axes[1]
+    ax5, ax6 = axes[2]
+    
+    rounds = [analysis['round'] for analysis in topology_analysis_history]
+    
+    # Plot 1: Network Topology Metrics
+    avg_degree = [analysis.get('avg_degree', 0) for analysis in topology_analysis_history]
+    clustering_coeff = [analysis.get('clustering_coefficient', 0) for analysis in topology_analysis_history]
+    network_density = [analysis.get('network_density', 0) for analysis in topology_analysis_history]
+    
+    ax1.plot(rounds, avg_degree, 'b-', label='Average Degree', linewidth=2)
+    ax1.plot(rounds, clustering_coeff, 'r--', label='Clustering Coefficient', linewidth=2)
+    ax1.plot(rounds, network_density, 'g:', label='Network Density', linewidth=2)
+    ax1.set_xlabel('Round')
+    ax1.set_ylabel('Metric Value')
+    ax1.set_title('Network Topology Evolution')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Connectivity Analysis
+    sink_connectivity = [analysis.get('sink_connectivity_ratio', 0) for analysis in topology_analysis_history]
+    avg_path_to_sink = [analysis.get('avg_path_to_sink', 0) for analysis in topology_analysis_history]
+    # Normalize avg_path_to_sink for plotting
+    max_path = max(avg_path_to_sink) if avg_path_to_sink else 1
+    normalized_path = [p/max_path if max_path > 0 else 0 for p in avg_path_to_sink]
+    
+    ax2.plot(rounds, sink_connectivity, 'purple', label='Sink Connectivity Ratio', linewidth=2)
+    ax2.plot(rounds, normalized_path, 'orange', label='Normalized Avg Path to Sink', linewidth=2)
+    ax2.set_xlabel('Round')
+    ax2.set_ylabel('Ratio/Normalized Value')
+    ax2.set_title('Network Connectivity Analysis')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Energy Distribution Analysis
+    energy_gini = [analysis.get('energy_gini', 0) for analysis in topology_analysis_history]
+    energy_cv = [analysis.get('energy_cv', 0) for analysis in topology_analysis_history]
+    
+    ax3.plot(rounds, energy_gini, 'darkred', label='Energy Gini Coefficient', linewidth=2)
+    ax3.plot(rounds, energy_cv, 'darkgreen', label='Energy Coefficient of Variation', linewidth=2)
+    ax3.set_xlabel('Round')
+    ax3.set_ylabel('Inequality Measure')
+    ax3.set_title('Energy Distribution Inequality')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Critical Nodes Analysis
+    critical_nodes = [analysis.get('critical_nodes', 0) for analysis in topology_analysis_history]
+    critical_ratio = [analysis.get('critical_node_ratio', 0) for analysis in topology_analysis_history]
+    
+    ax4.plot(rounds, critical_nodes, 'darkblue', label='Number of Critical Nodes', linewidth=2)
+    ax4_twin = ax4.twinx()
+    ax4_twin.plot(rounds, critical_ratio, 'red', label='Critical Node Ratio', linewidth=2, linestyle='--')
+    ax4.set_xlabel('Round')
+    ax4.set_ylabel('Number of Critical Nodes', color='darkblue')
+    ax4_twin.set_ylabel('Critical Node Ratio', color='red')
+    ax4.set_title('Critical Nodes Analysis')
+    ax4.grid(True, alpha=0.3)
+    
+    # Plot 5: Bottleneck History
+    if bottleneck_history:
+        bottleneck_counts = [len(bottlenecks) for bottlenecks in bottleneck_history]
+        if bottleneck_counts:
+            ax5.plot(range(len(bottleneck_counts)), bottleneck_counts, 'red', linewidth=2, marker='o')
+            ax5.set_xlabel('Analysis Interval')
+            ax5.set_ylabel('Number of Bottlenecks')
+            ax5.set_title('Network Bottlenecks Over Time')
+            ax5.grid(True, alpha=0.3)
+        else:
+            ax5.text(0.5, 0.5, 'No Bottleneck Data', horizontalalignment='center', 
+                    verticalalignment='center', transform=ax5.transAxes)
+    else:
+        ax5.text(0.5, 0.5, 'No Bottleneck Data', horizontalalignment='center', 
+                verticalalignment='center', transform=ax5.transAxes)
+    
+    # Plot 6: Energy Consumption Trends
+    if consumption_history:
+        ax6.plot(range(len(consumption_history)), consumption_history, 'green', linewidth=2)
+        # Add moving average
+        if len(consumption_history) > 10:
+            window_size = min(10, len(consumption_history))
+            moving_avg = []
+            for i in range(len(consumption_history)):
+                start_idx = max(0, i - window_size + 1)
+                moving_avg.append(np.mean(consumption_history[start_idx:i+1]))
+            ax6.plot(range(len(moving_avg)), moving_avg, 'darkgreen', linewidth=2, linestyle='--', label='Moving Average')
+            ax6.legend()
+        
+        ax6.set_xlabel('Round')
+        ax6.set_ylabel('Energy Consumption (J)')
+        ax6.set_title('Energy Consumption Trends')
+        ax6.grid(True, alpha=0.3)
+    else:
+        ax6.text(0.5, 0.5, 'No Consumption Data', horizontalalignment='center', 
+                verticalalignment='center', transform=ax6.transAxes)
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig('results/advanced_analysis.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print("Advanced analysis plots saved to 'results/advanced_analysis.png'")
 
 def run_proactive_gnn_wsn_simulation():
+    """Main simulation function that runs the proactive GNN-DRL WSN routing simulation"""
     print("Debug: Entered run_proactive_gnn_wsn_simulation")
     print("Initializing WSN...")
     try:
@@ -1691,152 +2478,10 @@ def run_proactive_gnn_wsn_simulation():
     print("Results saved in 'results/' directory")
     return metrics_history, network, final_metrics
 
-def plot_simulation_results(metrics_history, gnn_losses, drl_losses):
-    """Plot comprehensive simulation results"""
-    rounds = [m['round'] for m in metrics_history]
-    
-    # Create subplots with additional metrics
-    fig, axes = plt.subplots(6, 2, figsize=(18, 24)) # Increased rows for more plots
-    ax1, ax2 = axes[0]
-    ax3, ax4 = axes[1]
-    ax5, ax6 = axes[2]
-    ax7, ax8 = axes[3]
-    ax9, ax10 = axes[4] # New row for plots
-    ax11, ax12 = axes[5] # New row for plots
-    
-    # Plot 1: Network lifetime (alive nodes over time)
-    alive_percentages = [m['alive_percentage'] for m in metrics_history]
-    ax1.plot(rounds, alive_percentages, 'b-', linewidth=2)
-    ax1.set_xlabel('Round')
-    ax1.set_ylabel('Alive Nodes (%)')
-    ax1.set_title('Network Lifetime')
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Energy consumption
-    avg_energies = [m['avg_energy'] for m in metrics_history]
-    total_energies = [m['total_energy'] for m in metrics_history]
-    ax2.plot(rounds, avg_energies, 'g-', label='Average Energy', linewidth=2)
-    ax2.plot(rounds, total_energies, 'r--', label='Total Energy', linewidth=2)
-    ax2.set_xlabel('Round')
-    ax2.set_ylabel('Energy (J)')
-    ax2.set_title('Network Energy Consumption')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Network connectivity
-    connectivity = [m['sink_connectivity'] for m in metrics_history]
-    ax3.plot(rounds, connectivity, 'm-', linewidth=2)
-    ax3.set_xlabel('Round')
-    ax3.set_ylabel('Sink Connectivity (%)')
-    ax3.set_title('Network Connectivity')
-    ax3.grid(True, alpha=0.3)
-    
-    # Plot 4: Traffic distribution
-    avg_traffic = [m['avg_traffic'] for m in metrics_history]
-    ax4.plot(rounds, avg_traffic, 'c-', linewidth=2)
-    ax4.set_xlabel('Round')
-    ax4.set_ylabel('Average Traffic')
-    ax4.set_title('Traffic Distribution')
-    ax4.grid(True, alpha=0.3)
-    
-    # Plot 5: GNN training loss
-    if gnn_losses:
-        ax5.plot(range(len(gnn_losses)), gnn_losses, 'y-', linewidth=2)
-        ax5.set_xlabel('Training Iterations')
-        ax5.set_ylabel('Loss')
-        ax5.set_title('GNN Training Loss')
-        ax5.grid(True, alpha=0.3)
-    
-    # Plot 6: DRL training loss
-    if drl_losses:
-        ax6.plot(range(len(drl_losses)), drl_losses, 'k-', linewidth=2)
-        ax6.set_xlabel('Training Iterations')
-        ax6.set_ylabel('Loss')
-        ax6.set_title('DRL Training Loss')
-        ax6.grid(True, alpha=0.3)
-    
-    # Plot 7: First Node Death Time
-    first_death = None
-    for m in metrics_history:
-        if m['alive_nodes'] < NUM_NODES:
-            first_death = m['round']
-            break
-    if first_death:
-        ax7.axvline(x=first_death, color='r', linestyle='--', label=f'First Death at Round {first_death}')
-    ax7.plot(rounds, [m['alive_nodes'] for m in metrics_history], 'b-', linewidth=2)
-    ax7.set_xlabel('Round')
-    ax7.set_ylabel('Number of Alive Nodes')
-    ax7.set_title('First Node Death Time')
-    ax7.legend()
-    ax7.grid(True, alpha=0.3)
-    
-    # Plot 8: Network Throughput
-    # Calculate throughput as successful packet transmissions per round
-    throughput = []
-    for m in metrics_history:
-        # Calculate total bits transmitted in this round
-        bits_per_round = m['total_traffic'] * PACKET_SIZE  # bits per round
-        throughput.append(bits_per_round)  # bits per round
-    
-    ax8.plot(rounds, throughput, 'g-', linewidth=2)
-    ax8.set_xlabel('Round')
-    ax8.set_ylabel('Throughput (bits/round)')
-    ax8.set_title('Network Throughput')
-    ax8.ticklabel_format(style='sci', axis='y', scilimits=(0,0))  # Use scientific notation for y-axis
-    ax8.grid(True, alpha=0.3)
-
-    # Plot 9: Energy Variance
-    energy_variance = [m.get('energy_variance', 0) for m in metrics_history] # Use .get for safety
-    ax9.plot(rounds, energy_variance, 'p-', linewidth=2, label='Energy Variance')
-    ax9.set_xlabel('Round')
-    ax9.set_ylabel('Energy Variance (J^2)')
-    ax9.set_title('Energy Variance Over Time')
-    ax9.legend()
-    ax9.grid(True, alpha=0.3)
-
-    # Plot 10: Number of Active Cluster Heads
-    # Assuming 'num_cluster_heads' is or will be added to metrics
-    num_cluster_heads = [m.get('num_cluster_heads', np.nan) for m in metrics_history] # Use np.nan for missing data
-    ax10.plot(rounds, num_cluster_heads, 's-', linewidth=2, label='Active Cluster Heads')
-    ax10.set_xlabel('Round')
-    ax10.set_ylabel('Number of Cluster Heads')
-    ax10.set_title('Active Cluster Heads Over Time')
-    ax10.legend()
-    ax10.grid(True, alpha=0.3)
-
-    # Plot 11: DRL Epsilon Decay (Placeholder if not directly in metrics_history)
-
-    # This might need to be passed separately or calculated if agent's history is available
-    # For now, let's assume it might be added to metrics or we plot a placeholder
-    drl_epsilon = [m.get('drl_epsilon', np.nan) for m in metrics_history] # Placeholder
-    ax11.plot(rounds, drl_epsilon, 'd-', linewidth=2, label='DRL Epsilon')
-    ax11.set_xlabel('Round')
-    ax11.set_ylabel('Epsilon Value')
-    ax11.set_title('DRL Agent Epsilon Decay')
-    ax11.legend()
-    ax11.grid(True, alpha=0.3)
-
-    # Plot 12: Node Role Distribution (Placeholder - requires more data from metrics)
-    # This would typically be a stacked bar or area chart.
-    # For simplicity, if 'roles_distribution' (e.g., {'ch': count, 'member': count}) is in metrics:
-    # ch_counts = [m.get('roles_distribution', {}).get('ch', 0) for m in metrics_history]
-    # member_counts = [m.get('roles_distribution', {}).get('member', 0) for m in metrics_history]
-    # ax12.stackplot(rounds, ch_counts, member_counts, labels=['Cluster Heads', 'Member Nodes'], alpha=0.7)
-    ax12.text(0.5, 0.5, 'Node Role Distribution (Placeholder)', horizontalalignment='center', verticalalignment='center', transform=ax12.transAxes)
-    ax12.set_xlabel('Round')
-    ax12.set_ylabel('Number of Nodes')
-    ax12.set_title('Node Role Distribution Over Time')
-    ax12.legend()
-    ax12.grid(True, alpha=0.3)
-    
-    # Adjust layout and save
-    plt.tight_layout()
-    plt.savefig('results/performance_metrics.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
 def main():
-    global MAX_ROUNDS
     """Main function to run the simulation"""
+    global MAX_ROUNDS
+    
     print("\nProactive GNN-DRL WSN Routing Simulation")
     print("=" * 50)
     print(f"Configuration:")
@@ -1847,9 +2492,16 @@ def main():
     print(f"Using device: {device}")
     print("=" * 50)
 
-    # Use default rounds (remove interactive input for now)
-    num_rounds = MAX_ROUNDS
-    print(f"Using {num_rounds} rounds for simulation")
+    # Prompt user for number of rounds
+    try:
+        user_input = input(f"Enter the number of rounds to execute (default {MAX_ROUNDS}): ")
+        num_rounds = int(user_input) if user_input.strip() else MAX_ROUNDS
+        if num_rounds <= 0:
+            print(f"Invalid input. Using default value: {MAX_ROUNDS}")
+            num_rounds = MAX_ROUNDS
+    except Exception:
+        print(f"Invalid input. Using default value: {MAX_ROUNDS}")
+        num_rounds = MAX_ROUNDS
     MAX_ROUNDS = num_rounds
 
     # Create results directory if it doesn't exist
@@ -1860,39 +2512,77 @@ def main():
         # Run simulation
         metrics_history, final_network, final_metrics = run_proactive_gnn_wsn_simulation()
         
-        # Generate and save comprehensive analysis
-        print("\nGenerating comprehensive analysis...")
+        # Print final summary
+        print("\nSimulation Summary:")
+        print("=" * 50)
+        print(f"Network lifetime: {len(metrics_history)} rounds")
+        print(f"Final alive nodes: {final_metrics['alive_nodes']}/{NUM_NODES} ({final_metrics['alive_percentage']:.1f}%)")
+        print(f"Final network energy: {final_metrics['total_energy']:.3f}J")
+        print(f"Final network connectivity: {final_metrics['sink_connectivity']:.1f}%")
+        print("=" * 50)
         
-        # Save simulation results
+        # Save simulation timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open('results/simulation_timestamp.txt', 'w') as f:
+            f.write(f"Simulation completed at: {timestamp}\n")
+            f.write(f"Network lifetime: {len(metrics_history)} rounds\n")
         
-        # Save final network state
-        final_network_file = f'results/final_network_{timestamp}.json'
-        with open(final_network_file, 'w') as f:
-            json.dump(final_network, f, indent=2, default=str)
+        print("\nSimulation completed successfully!")
+        print("Results saved in 'results' directory")
         
-        # Save metrics history
-        metrics_file = f'results/metrics_history_{timestamp}.json'
-        with open(metrics_file, 'w') as f:
-            json.dump(metrics_history, f, indent=2, default=str)
+        # Print node information table
+        print_node_table(final_network)
         
-        # Save final metrics
-        final_metrics_file = f'results/final_metrics_{timestamp}.json'
-        with open(final_metrics_file, 'w') as f:
-            json.dump(final_metrics, f, indent=2, default=str)
-        
-        print(f"\nSimulation completed successfully!")
-        print(f"Results saved with timestamp: {timestamp}")
-        print(f"Final network lifetime: {final_metrics.get('network_lifetime', 0)} rounds")
-        print(f"Final alive nodes: {final_metrics.get('final_alive_nodes', 0)}/{NUM_NODES}")
-        print(f"Average energy consumption: {final_metrics.get('avg_energy_consumption', 0):.3f}J")
-        
-    except KeyboardInterrupt:
-        print("\nSimulation interrupted by user.")
     except Exception as e:
-        print(f"\nError during simulation: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\nError during simulation: {str(e)}")
+        raise
+
+def print_node_table(network):
+    """Print a formatted table with node information"""
+    # Header
+    print("\nNode Information Table")
+    print("=" * 100)
+    print("{:^6} | {:^10} | {:^12} | {:^12} | {:^10} | {:^8} | {:^12} | {:^15}".format(
+        "ID", "Status", "Energy (J)", "Energy (%)", "Role", "Traffic", "Position", "Dist to Sink"
+    ))
+    print("-" * 100)
+    
+    # Sort nodes by ID for better readability
+    sorted_nodes = sorted(network, key=lambda x: x['id'])
+    
+    for node in sorted_nodes:
+        # Calculate energy percentage
+        energy_percent = (node['E'] / node['Eo']) * 100
+        # Get node status
+        status = "Alive" if node['cond'] == 1 else "Dead"
+        # Get node role
+        role = "CH" if node['role'] == 1 else "Node"
+        # Calculate distance to sink
+        dist_to_sink = np.sqrt((node['x'] - SINK_X)**2 + (node['y'] - SINK_Y)**2)
+        # Format position
+        position = f"({node['x']:.1f}, {node['y']:.1f})"
+        
+        print("{:^6} | {:^10} | {:^12.3f} | {:^12.2f} | {:^10} | {:^8} | {:^12} | {:^15.2f}".format(
+            node['id'],
+            status,
+            node['E'],
+            energy_percent,
+            role,
+            node.get('traffic', 0),
+            position,
+            dist_to_sink
+        ))
+    
+    print("=" * 100)
+    
+    # Print summary statistics
+    alive_nodes = [n for n in network if n['cond'] == 1]
+    print("\nSummary Statistics:")
+    print(f"Total Alive Nodes: {len(alive_nodes)}/{len(network)}")
+    print(f"Average Remaining Energy: {sum(n['E'] for n in network)/len(network):.3f}J")
+    print(f"Total Network Traffic: {sum(n.get('traffic', 0) for n in network)} packets")
+    cluster_heads = [n for n in network if n['role'] == 1 and n['cond'] == 1]
+    print(f"Active Cluster Heads: {len(cluster_heads)}")
 
 if __name__ == "__main__":
     main()
