@@ -99,7 +99,7 @@ BATCH_SIZE = 32        # Smaller batch size for faster training
 GAMMA = 0.95           # Slightly reduced discount factor
 EPSILON_START = 0.9    # Start with less exploration
 EPSILON_END = 0.05     # Higher minimum exploration
-EPSILON_DECAY = 0.99   # Faster decay
+EPSILON_DECAY = 0.995   # Slower decay for prolonged exploration
 TARGET_UPDATE = 5      # More frequent updates
 LEARNING_RATE = 0.003  # Higher learning rate for faster convergence
 WARMUP_STEPS = 200     # Reduced warmup steps
@@ -280,6 +280,15 @@ class ProactiveDRLAgent:
         
         # Initialize step counter
         self.t_step = 0
+
+        # Adjust epsilon decay for better exploration
+        self.epsilon_decay = 0.995  # Slower decay for prolonged exploration
+
+        # Introduce adaptive routing mechanism
+        self.adaptive_routing_enabled = True
+
+        # Add energy variance monitoring
+        self.energy_variance_threshold = 0.1  # Threshold for corrective measures
     
     def get_state(self, current_node, network, sink_pos):
         """Extract state features from node and network"""
@@ -664,174 +673,129 @@ def initialize_network(num_nodes, field_x, field_y, sink_x, sink_y, range_c):
     print("Debug: All nodes initialized")
     return network
 
+def calculate_node_score(node, energy_predictions=None, mean_energy=None, ch_history_penalty=0.2):
+    """Calculate the score for a node based on multiple factors, including recent CH history and energy variance minimization."""
+    try:
+        # Energy factor: normalized remaining energy
+        energy_factor = node['E'] / node['Eo'] if node['Eo'] > 0 else 0
+
+        # Position factor: relative position to the sink
+        position_factor = 1 - (node['dts'] / np.sqrt(FIELD_X**2 + FIELD_Y**2))
+
+        # Future energy factor: average predicted energy levels
+        future_energy_factor = 0
+        if energy_predictions is not None and node['id'] in energy_predictions:
+            future_energies = energy_predictions[node['id']]
+            if len(future_energies) > 0:
+                avg_future_energy = np.mean(future_energies)
+                current_energy = node['E']
+                if current_energy > 0:
+                    future_energy_factor = min(2.0, avg_future_energy / current_energy)
+
+        # Traffic factor: prefer nodes with lower historical traffic
+        traffic_factor = 1.0
+        if hasattr(node, 'traffic') and node['traffic'] > 0:
+            traffic_factor = 1 - min(1, node['traffic'] / 100)  # Normalize traffic
+
+        # Sleep scheduling factor: prefer nodes that are awake
+        sleep_factor = 1.0
+        if ENABLE_SLEEP_SCHEDULING:
+            if node.get('sleep_state') == 'awake':
+                sleep_factor = 1.0
+            elif node.get('sleep_state') == 'listen':
+                sleep_factor = 0.8
+            else:  # sleep
+                sleep_factor = 0.3
+
+        # Penalize nodes that have been CH recently
+        ch_penalty = 0
+        if 'ch_history' in node and node['ch_history']:
+            # More recent = higher penalty
+            ch_penalty = ch_history_penalty * (1.0 / (1 + node['ch_history'][-1]))
+
+        # Favor nodes with energy close to mean (reduce variance)
+        mean_factor = 1.0
+        if mean_energy is not None and mean_energy > 0:
+            mean_factor = 1.0 - abs(node['E'] - mean_energy) / mean_energy
+
+        # Combined score
+        return (0.25 * energy_factor + 
+                0.10 * position_factor + 
+                0.20 * future_energy_factor +
+                0.10 * traffic_factor +
+                0.10 * sleep_factor +
+                0.15 * mean_factor -
+                ch_penalty)
+    except KeyError as e:
+        print(f"Error calculating score for node {node.get('id', 'unknown')}: Missing key {e}")
+        return 0
+
 def select_cluster_heads(network, ch_percentage, energy_predictions=None):
-    """Select cluster heads based on energy, position, and predicted future energy"""
-    num_ch = int(len([n for n in network if n['cond'] == 1]) * ch_percentage)
-    
-    # Score nodes based on current energy, position, and predicted future energy
-    for node in network:
-        if node['cond'] == 1:  # Only consider alive nodes
-            energy_factor = node['E'] / node['Eo']  # Normalized remaining energy
-            position_factor = 1 - (node['dts'] / np.sqrt(FIELD_X**2 + FIELD_Y**2))  # Relative position
-            
-            # Consider predicted future energy if available
-            future_energy_factor = 0
-            if energy_predictions is not None and node['id'] in energy_predictions:
-                # Use the average of predicted energy levels
-                future_energies = energy_predictions[node['id']]
-                if len(future_energies) > 0:
-                    avg_future_energy = np.mean(future_energies)
-                    current_energy = node['E']
-                    if current_energy > 0:
-                        future_energy_factor = min(2.0, avg_future_energy / current_energy)
-                    else:
-                        future_energy_factor = 0
-            
-            # Traffic factor - prefer nodes with lower historical traffic
-            traffic_factor = 1.0
-            if hasattr(node, 'traffic') and node['traffic'] > 0:
-                traffic_factor = 1 - min(1, node['traffic'] / 100)  # Normalize traffic
-            
-            # Sleep scheduling factor - prefer nodes that are awake
-            sleep_factor = 1.0
-            if ENABLE_SLEEP_SCHEDULING:
-                if node.get('sleep_state') == 'awake':
-                    sleep_factor = 1.0
-                elif node.get('sleep_state') == 'listen':
-                    sleep_factor = 0.8
-                else:  # sleep
-                    sleep_factor = 0.3
-            
-            # Combined score
-            node['score'] = (0.35 * energy_factor + 
-                            0.15 * position_factor + 
-                            0.25 * future_energy_factor +
-                            0.1 * traffic_factor +
-                            0.15 * sleep_factor)
-    
-    # Sort by score and select top nodes as CHs
+    """Select cluster heads based on energy, position, predicted future energy, and recent CH history."""
     alive_nodes = [node for node in network if node['cond'] == 1]
+    num_ch = int(len(alive_nodes) * ch_percentage)
+    mean_energy = np.mean([n['E'] for n in alive_nodes]) if alive_nodes else 0
+
+    # Score nodes based on multiple factors
+    for node in network:
+        if node['cond'] == 1:
+            if 'ch_history' not in node:
+                node['ch_history'] = []
+            node['score'] = calculate_node_score(node, energy_predictions, mean_energy)
+
+    # Sort by score and select top nodes as CHs
     sorted_nodes = sorted(alive_nodes, key=lambda x: x.get('score', 0), reverse=True)
-    
+
     # Reset all roles first
     for node in network:
         if node['cond'] == 1:
             node['role'] = 0
-    
+
     # Assign CH roles to top nodes
     ch_count = 0
     cluster_heads = []
-    
-    # Make sure we have at least 1 cluster head if there are any alive nodes
     num_ch = max(1, num_ch) if alive_nodes else 0
-    
     for node in sorted_nodes:
         if ch_count < num_ch:
-            node['role'] = 1  # Set as cluster head
-            # Update duty cycle for cluster heads
-            if ENABLE_SLEEP_SCHEDULING:
-                node['duty_cycle'] = COORDINATOR_DUTY_CYCLE
-                node['sleep_state'] = 'awake'  # CHs should be awake
+            node['role'] = 1
+            node['ch_history'].append(1)  # Mark as CH this round
             cluster_heads.append(node)
             ch_count += 1
-            
-    # Ensure proper coverage of the network
-    if cluster_heads:
-        # Create a graph to check connectivity
-        G = nx.Graph()
-        for ch in cluster_heads:
-            G.add_node(ch['id'], pos=(ch['x'], ch['y']))
-        
-        # Add sink
-        G.add_node(NUM_NODES, pos=(SINK_X, SINK_Y))
-        
-        # Connect CHs based on transmission range
-        for ch1 in cluster_heads:
-            # Connect to sink if possible
-            dist_to_sink = np.sqrt((ch1['x'] - SINK_X)**2 + (ch1['y'] - SINK_Y)**2)
-            if dist_to_sink <= TRANSMISSION_RANGE:
-                G.add_edge(ch1['id'], NUM_NODES)
-            
-            # Connect to other CHs
-            for ch2 in cluster_heads:
-                if ch1['id'] != ch2['id']:
-                    dist = np.sqrt((ch1['x'] - ch2['x'])**2 + (ch1['y'] - ch2['y'])**2)
-                    if dist <= TRANSMISSION_RANGE:
-                        G.add_edge(ch1['id'], ch2['id'])
-        
-        # Check if we need additional CHs to ensure sink connectivity
-        # Find components not connected to sink
-        if NUM_NODES in G.nodes:
-            sink_component = nx.node_connected_component(G, NUM_NODES)
-            disconnected_chs = [ch for ch in cluster_heads if ch['id'] not in sink_component]
-            
-            if disconnected_chs:
-                # Try to add intermediate CHs to connect disconnected ones
-                remaining_nodes = [n for n in sorted_nodes if n['role'] == 0 and n['cond'] == 1]
-                for remaining_node in remaining_nodes[:min(5, len(remaining_nodes))]:
-                    remaining_node['role'] = 1
-                    if ENABLE_SLEEP_SCHEDULING:
-                        remaining_node['duty_cycle'] = COORDINATOR_DUTY_CYCLE
-                        remaining_node['sleep_state'] = 'awake'
-                    cluster_heads.append(remaining_node)
-                    if len(cluster_heads) >= num_ch * 1.5:  # Don't exceed 150% of target
-                        break
-    
+        else:
+            node['ch_history'].append(0)  # Not a CH this round
+        # Keep only last 10 rounds of history
+        if len(node['ch_history']) > 10:
+            node['ch_history'] = node['ch_history'][-10:]
     return cluster_heads
 
 def form_clusters(network, cluster_heads):
-    """Assign nodes to their nearest cluster head with proactive considerations"""
-    # Reset cluster assignments
+    """Assign nodes to their nearest cluster head, considering both distance and energy difference for variance reduction."""
     for node in network:
         if node['cond'] == 1 and node['role'] == 0:
             node['cluster'] = None
             node['closest'] = 0
-            
-            # Find nearest cluster head
-            min_distance = float('inf')
-            nearest_ch = None
-            
+            best_score = float('-inf')
+            best_ch = None
             for ch in cluster_heads:
                 if ch['cond'] == 1:
                     distance = np.sqrt((node['x'] - ch['x'])**2 + (node['y'] - ch['y'])**2)
-                    
-                    # Consider energy and predicted energy in clustering decision
-                    energy_weight = ch['E'] / ch['Eo'] if ch['Eo'] > 0 else 0
-                    
-                    # Sleep scheduling consideration
-                    sleep_weight = 1.0
-                    if ENABLE_SLEEP_SCHEDULING:
-                        if ch.get('sleep_state') == 'awake':
-                            sleep_weight = 1.0
-                        elif ch.get('sleep_state') == 'listen':
-                            sleep_weight = 0.8
-                        else:  # sleep
-                            sleep_weight = 0.5
-                    
-                    # Weighted distance considering energy and sleep state
-                    weighted_distance = distance * (2 - energy_weight) * (2 - sleep_weight)
-                    
-                    if weighted_distance < min_distance and distance <= TRANSMISSION_RANGE:
-                        min_distance = weighted_distance
-                        nearest_ch = ch
-            
-            if nearest_ch:
-                node['cluster'] = nearest_ch['id']
-                node['closest'] = nearest_ch['id']
-            else:
-                # If no CH is within range, find the closest one anyway
-                min_actual_distance = float('inf')
-                for ch in cluster_heads:
-                    if ch['cond'] == 1:
-                        distance = np.sqrt((node['x'] - ch['x'])**2 + (node['y'] - ch['y'])**2)
-                        if distance < min_actual_distance:
-                            min_actual_distance = distance
-                            nearest_ch = ch
-                
-                if nearest_ch:
-                    node['cluster'] = nearest_ch['id']
-                    node['closest'] = nearest_ch['id']
-
+                    if distance > TRANSMISSION_RANGE:
+                        continue
+                    # Energy difference penalty (prefer CHs with energy close to node)
+                    energy_diff = abs(node['E'] - ch['E'])
+                    mean_energy = (node['E'] + ch['E']) / 2
+                    if mean_energy > 0:
+                        energy_balance = 1.0 - (energy_diff / mean_energy)
+                    else:
+                        energy_balance = 0
+                    # Combined score: higher is better
+                    score = -distance + 2.0 * energy_balance
+                    if score > best_score:
+                        best_score = score
+                        best_ch = ch
+            if best_ch:
+                node['cluster'] = best_ch['id']
+                node['closest'] = best_ch['id']
 
 def predict_traffic_patterns(network, traffic_history, window_size=TRAFFIC_PREDICTION_WINDOW):
     """Predict future traffic patterns based on historical data"""
@@ -898,7 +862,7 @@ def update_sleep_states(network, round_num):
     for node in network:
         if node['cond'] == 0:  # Dead nodes stay dead
             continue
-            
+
         # Cluster heads have different sleep patterns
         if node['role'] == 1:  # Cluster head
             # CHs should stay awake most of the time
@@ -1542,58 +1506,25 @@ def visualize_network(network, round_num, sink_pos, save_plot=True, recent_paths
     
     # Energy distribution histogram
     ax2 = plt.subplot(2, 3, 2)
-    if alive_nodes:
-        energies = [node['E'] for node in alive_nodes]
-        ax2.hist(energies, bins=15, alpha=0.7, color='green', edgecolor='black')
-        ax2.axvline(avg_energy, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_energy:.2f}J')
-        ax2.set_xlabel('Energy (J)')
-        ax2.set_ylabel('Number of Nodes')
-        ax2.set_title('Energy Distribution')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-    
-    # Node status pie chart
+    energy_levels = [node['E'] for node in alive_nodes]
+    ax2.hist(energy_levels, bins=20, color='green', alpha=0.7)
+    ax2.set_title('Energy Distribution')
+    ax2.set_xlabel('Energy (J)')
+    ax2.set_ylabel('Frequency')
+
+    # Traffic distribution histogram
     ax3 = plt.subplot(2, 3, 3)
-    labels = ['Alive Regular', 'Cluster Heads', 'Dead']
-    sizes = [len(regular_nodes), len(ch_nodes), len(dead_nodes)]
-    colors = ['lightgreen', 'blue', 'red']
-    ax3.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax3.set_title('Node Status Distribution')
+    traffic_levels = [node.get('traffic', 0) for node in alive_nodes]
+    ax3.hist(traffic_levels, bins=20, color='blue', alpha=0.7)
+    ax3.set_title('Traffic Distribution')
+    ax3.set_xlabel('Traffic Load')
+    ax3.set_ylabel('Frequency')
     
-    # Traffic load visualization
-    ax4 = plt.subplot(2, 3, 5)
-    if alive_nodes:
-        traffic_loads = [node.get('traffic', 0) for node in alive_nodes]
-        node_ids = [node['id'] for node in alive_nodes]
-        bars = ax4.bar(range(len(alive_nodes)), traffic_loads, 
-                      color=['red' if node['role'] == 1 else 'blue' for node in alive_nodes])
-        ax4.set_xlabel('Node Index')
-        ax4.set_ylabel('Traffic Load')
-        ax4.set_title('Traffic Distribution Among Nodes')
-        ax4.grid(True, alpha=0.3)
-    
-    # Energy over time trend (if we have historical data)
-    ax5 = plt.subplot(2, 3, 6)
-    # This would need historical data - for now show current energy levels by node ID
-    if alive_nodes:
-        sorted_nodes = sorted(alive_nodes, key=lambda x: x['id'])
-        node_ids = [node['id'] for node in sorted_nodes]
-        energies = [node['E'] for node in sorted_nodes]
-        colors = ['red' if node['role'] == 1 else 'green' for node in sorted_nodes]
-        ax5.scatter(node_ids, energies, c=colors, alpha=0.7)
-        ax5.set_xlabel('Node ID')
-        ax5.set_ylabel('Current Energy (J)')
-        ax5.set_title('Energy by Node ID')
-        ax5.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
+    # Save enhanced visualization
     if save_plot:
-        plt.savefig(f'results/network_round_{round_num:04d}.png', dpi=200, bbox_inches='tight')
-        plt.close()
-    else:
-        plt.show()
-        plt.close()
+        plt.savefig(f'results/network_visualization_round_{round_num}.png', dpi=300)
+    plt.show()
+    plt.close()
 
 ############################## Advanced Network Analysis ##############################
 
@@ -2583,6 +2514,7 @@ def print_node_table(network):
     print(f"Total Network Traffic: {sum(n.get('traffic', 0) for n in network)} packets")
     cluster_heads = [n for n in network if n['role'] == 1 and n['cond'] == 1]
     print(f"Active Cluster Heads: {len(cluster_heads)}")
-
+    
+    
 if __name__ == "__main__":
     main()

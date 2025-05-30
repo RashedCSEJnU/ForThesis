@@ -1,2 +1,2 @@
-Simulation completed at: 20250527_211857
-Network lifetime: 1500 rounds
+Simulation completed at: 20250531_002259
+Network lifetime: 100 rounds
