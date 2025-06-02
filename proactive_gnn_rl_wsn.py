@@ -717,6 +717,9 @@ def calculate_node_score(node, energy_predictions=None, mean_energy=None, ch_his
         mean_factor = 1.0
         if mean_energy is not None and mean_energy > 0:
             mean_factor = 1.0 - abs(node['E'] - mean_energy) / mean_energy
+            # Penalize nodes with extreme energy levels
+            if node['E'] < mean_energy * 0.5 or node['E'] > mean_energy * 1.5:
+                mean_factor *= 0.8  # Reduce score for extreme energy levels
 
         # Combined score
         return (0.25 * energy_factor + 
@@ -768,8 +771,8 @@ def select_cluster_heads(network, ch_percentage, energy_predictions=None):
             node['ch_history'] = node['ch_history'][-10:]
     return cluster_heads
 
-def form_clusters(network, cluster_heads):
-    """Assign nodes to their nearest cluster head, considering both distance and energy difference for variance reduction."""
+def form_clusters(network, cluster_heads, traffic_predictions):
+    """Assign nodes to their nearest cluster head, considering distance, energy difference, and traffic predictions for variance reduction."""
     for node in network:
         if node['cond'] == 1 and node['role'] == 0:
             node['cluster'] = None
@@ -781,15 +784,18 @@ def form_clusters(network, cluster_heads):
                     distance = np.sqrt((node['x'] - ch['x'])**2 + (node['y'] - ch['y'])**2)
                     if distance > TRANSMISSION_RANGE:
                         continue
+
                     # Energy difference penalty (prefer CHs with energy close to node)
                     energy_diff = abs(node['E'] - ch['E'])
                     mean_energy = (node['E'] + ch['E']) / 2
-                    if mean_energy > 0:
-                        energy_balance = 1.0 - (energy_diff / mean_energy)
-                    else:
-                        energy_balance = 0
+                    energy_balance = 1.0 - (energy_diff / mean_energy) if mean_energy > 0 else 0
+
+                    # Traffic prediction penalty (prefer CHs with lower predicted traffic)
+                    traffic_penalty = traffic_predictions.get(ch['id'], 0)
+                    traffic_factor = 1.0 - min(1, traffic_penalty / 100)  # Normalize traffic
+
                     # Combined score: higher is better
-                    score = -distance + 2.0 * energy_balance
+                    score = -distance + 2.0 * energy_balance + 1.0 * traffic_factor
                     if score > best_score:
                         best_score = score
                         best_ch = ch
@@ -1614,35 +1620,33 @@ def calculate_gini_coefficient(values):
     gini = (2 * np.sum(index * sorted_values)) / (n * np.sum(sorted_values)) - (n + 1) / n
     return gini if not np.isnan(gini) else 0
 
-def detect_network_bottlenecks(network, traffic_threshold=10):
-    """Detect potential network bottlenecks based on traffic and topology"""
+def detect_network_bottlenecks(network, G, traffic_threshold=10):
+    """Detect potential network bottlenecks based on traffic load, node criticality, and energy levels"""
     alive_nodes = [node for node in network if node['cond'] == 1]
-    G = create_network_graph(alive_nodes, (SINK_X, SINK_Y), TRANSMISSION_RANGE)
-    
     bottlenecks = []
-    
+
     for node in alive_nodes:
         bottleneck_score = 0
-        
+
         # High traffic load
         traffic = node.get('traffic', 0)
         if traffic > traffic_threshold:
             bottleneck_score += traffic / traffic_threshold
-        
+
         # Critical node (articulation point)
         if node['id'] in nx.articulation_points(G):
             bottleneck_score += 2.0
-        
+
         # Low energy with high degree
         degree = G.degree(node['id']) if node['id'] in G.nodes else 0
         energy_ratio = node['E'] / node['Eo'] if node['Eo'] > 0 else 0
         if degree > 3 and energy_ratio < 0.3:
             bottleneck_score += 1.5
-        
+
         # Cluster head with high load
         if node.get('role') == 1 and traffic > 5:
             bottleneck_score += 1.0
-        
+
         if bottleneck_score > 2.0:
             bottlenecks.append({
                 'node_id': node['id'],
@@ -1652,7 +1656,7 @@ def detect_network_bottlenecks(network, traffic_threshold=10):
                 'degree': degree,
                 'role': node.get('role', 0)
             })
-    
+
     return sorted(bottlenecks, key=lambda x: x['score'], reverse=True)
 
 def predict_network_lifetime(network, current_round, consumption_history):
@@ -2259,7 +2263,7 @@ def run_proactive_gnn_wsn_simulation():
             cluster_heads = select_cluster_heads(network, CH_PERCENTAGE, energy_predictions)
             
             # Form clusters
-            form_clusters(network, cluster_heads)
+            form_clusters(network, cluster_heads, traffic_predictions)
             
             # Simulate data transmission from random nodes
             num_transmissions = min(10, len(alive_nodes))  # Simulate 10 random transmissions
@@ -2348,6 +2352,14 @@ def run_proactive_gnn_wsn_simulation():
             metrics = calculate_network_metrics(network, round_num, agent.epsilon) # Pass agent.epsilon
             metrics_history.append(metrics)
             
+            # Detect network bottlenecks
+            network_graph = create_network_graph(network, sink_pos, TRANSMISSION_RANGE)
+            bottlenecks = detect_network_bottlenecks(network, network_graph)
+            print(f"Round {round_num}: Detected bottlenecks - {bottlenecks}")
+            
+            # Save bottleneck data for analysis
+            bottleneck_history.append({'round': round_num, 'bottlenecks': bottlenecks})
+
             # Print progress every 100 rounds
             if round_num % 100 == 0:
                 print(f"\nRound {round_num}:")
@@ -2400,6 +2412,10 @@ def run_proactive_gnn_wsn_simulation():
     with open('results/simulation_results.json', 'w') as f:
         json.dump(results_data, f, indent=2)
     
+    # Save bottleneck history to file after simulation
+    with open('results/bottleneck_history.json', 'w') as f:
+        json.dump(bottleneck_history, f, indent=4)
+
     # Plot performance metrics
     plot_simulation_results(metrics_history, gnn_losses, drl_losses)
     
